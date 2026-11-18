@@ -5,11 +5,13 @@ const GLib = imports.gi.GLib;
 const Gio = imports.gi.Gio;
 const St = imports.gi.St;
 const Clutter = imports.gi.Clutter;
+const Cinnamon = imports.gi.Cinnamon;
 
 const UUID = "cinnamon-fullscreen-to-workspace@arashdayaniii";
 
 let extSettings = null;
 let trackedWindows = new Map();
+let dedicatedWorkspaces = new Map();
 let globalSignals = [];
 let activeTimeouts = new Set();
 let wmPrefs = null;
@@ -222,16 +224,160 @@ function scheduleRectUpdate(win) {
     });
 }
 
+function getWindowAppName(win) {
+    if (!win) return "App";
+    try {
+        let tracker = Cinnamon.WindowTracker.get_default();
+        let app = tracker.get_window_app(win);
+        if (app) {
+            let name = app.get_name();
+            if (name && name.trim().length > 0) return name.trim();
+        }
+    } catch (e) {}
+
+    try {
+        let wmClass = win.get_wm_class();
+        if (wmClass && wmClass.trim().length > 0) {
+            let c = wmClass.trim();
+            return c.charAt(0).toUpperCase() + c.slice(1);
+        }
+    } catch (e) {}
+
+    try {
+        let title = win.get_title();
+        if (title && title.trim().length > 0) return title.trim();
+    } catch (e) {}
+
+    return "App";
+}
+
+function getDedicatedWindowForWorkspace(ws) {
+    if (!ws) return null;
+    let win = dedicatedWorkspaces.get(ws);
+    if (win && isWindowAlive(win)) return win;
+
+    for (let w of trackedWindows.keys()) {
+        if (w._macDedicated && (w._macDedicated.dedWs === ws || (w._macDedicated.dedWs && w._macDedicated.dedWs.index() === ws.index()))) {
+            return w;
+        }
+    }
+    return null;
+}
+
+function isChildOrDialogOf(otherWin, parentWin) {
+    if (!otherWin || !parentWin) return false;
+    if (otherWin === parentWin) return true;
+
+    try {
+        if (otherWin.get_transient_for() === parentWin) return true;
+    } catch (e) {}
+
+    try {
+        if (otherWin.find_root_ancestor() === parentWin) return true;
+    } catch (e) {}
+
+    try {
+        if (typeof otherWin.is_ancestor_of_transient === "function" && otherWin.is_ancestor_of_transient(parentWin)) {
+            return true;
+        }
+    } catch (e) {}
+
+    try {
+        if (otherWin.window_type !== Meta.WindowType.NORMAL) {
+            let tracker = Cinnamon.WindowTracker.get_default();
+            let appOther = tracker.get_window_app(otherWin);
+            let appParent = tracker.get_window_app(parentWin);
+            if (appOther && appParent && appOther === appParent) return true;
+            if (otherWin.get_pid && parentWin.get_pid && otherWin.get_pid() === parentWin.get_pid()) return true;
+        }
+    } catch (e) {}
+
+    return false;
+}
+
+function getNonDedicatedWorkspace(preferredWs) {
+    let wsMgr = global.workspace_manager;
+    let n = wsMgr.get_n_workspaces();
+
+    if (preferredWs && preferredWs.index() >= 0 && preferredWs.index() < n) {
+        if (!getDedicatedWindowForWorkspace(preferredWs)) {
+            return preferredWs;
+        }
+    }
+
+    for (let i = 0; i < n; i++) {
+        let ws = wsMgr.get_workspace_by_index(i);
+        if (!getDedicatedWindowForWorkspace(ws)) {
+            return ws;
+        }
+    }
+
+    return wsMgr.append_new_workspace(false, global.get_current_time());
+}
+
+function enforceDedicatedWorkspaceExclusivity(win) {
+    if (!win || win._macRelocating) return;
+    try {
+        if (win.is_on_all_workspaces()) return;
+    } catch (e) {
+        return;
+    }
+
+    let ws = null;
+    try {
+        ws = win.get_workspace();
+    } catch (e) {}
+    if (!ws) return;
+
+    let dedicatedWin = getDedicatedWindowForWorkspace(ws);
+    if (!dedicatedWin) return;
+
+    if (win === dedicatedWin) return;
+    if (isChildOrDialogOf(win, dedicatedWin)) return;
+
+    win._macRelocating = true;
+    try {
+        let targetWs = getNonDedicatedWorkspace(dedicatedWin._macDedicated ? dedicatedWin._macDedicated.origWs : null);
+        logDebug(`Ejecting win='${win.get_title()}' from dedicated workspace '${Main.getWorkspaceName(ws.index())}' to workspace ${targetWs.index()}`);
+
+        win.change_workspace(targetWs);
+
+        let activeWs = global.workspace_manager.get_active_workspace();
+        if (activeWs === ws) {
+            targetWs.activate_with_focus(win, global.get_current_time());
+        }
+    } catch (e) {
+        logDebug(`Error ejecting window: ${e}`);
+    } finally {
+        scheduleTimeout(100, () => {
+            if (win) delete win._macRelocating;
+        });
+    }
+}
+
 function removeWorkspaceIfEmpty(ws, fallbackWs) {
     if (!ws || ws === fallbackWs) return;
     let wsMgr = global.workspace_manager;
-    if (wsMgr.get_n_workspaces() <= 1) return;
+    if (wsMgr.get_n_workspaces() <= 1) {
+        try { Main.setWorkspaceName(ws.index(), ""); } catch (e) {}
+        return;
+    }
 
     let remaining = ws.list_windows().filter(
         w => !w.is_on_all_workspaces() && w.window_type === Meta.WindowType.NORMAL
     );
     if (remaining.length === 0) {
-        wsMgr.remove_workspace(ws, global.get_current_time());
+        dedicatedWorkspaces.delete(ws);
+        try {
+            if (typeof Main._removeWorkspace === "function") {
+                Main._removeWorkspace(ws);
+            } else {
+                Main.setWorkspaceName(ws.index(), "");
+                wsMgr.remove_workspace(ws, global.get_current_time());
+            }
+        } catch (e) {
+            try { wsMgr.remove_workspace(ws, global.get_current_time()); } catch (err) {}
+        }
     }
 }
 
@@ -519,6 +665,16 @@ function enterDedicatedWorkspace(win, wasMaximized) {
     let t = global.get_current_time();
     let newWs = wsMgr.append_new_workspace(false, t);
     win._macDedicated.dedWs = newWs;
+    dedicatedWorkspaces.set(newWs, win);
+
+    let appName = getWindowAppName(win);
+    win._macDedicated.appName = appName;
+    try {
+        Main.setWorkspaceName(newWs.index(), appName);
+        logDebug(`enter: workspace ${newWs.index()} named '${appName}'`);
+    } catch (e) {
+        logDebug(`Failed to set workspace name: ${e}`);
+    }
 
     scheduleTimeout(preDelay, () => {
         if (!isWindowAlive(win) || !win._macDedicated) return;
@@ -600,6 +756,7 @@ function exitDedicatedWorkspace(win) {
                 if (actor) actor.queue_redraw();
                 win.activate(global.get_current_time());
                 removeWorkspaceIfEmpty(data.dedWs, targetWs);
+                dedicatedWorkspaces.delete(data.dedWs);
 
                 scheduleTimeout(180, () => {
                     if (isWindowAlive(win)) {
@@ -710,6 +867,7 @@ function onWindowUnmanaged(win) {
     let data = win._macDedicated;
     win._macDedicated = null;
     if (data) {
+        if (data.dedWs) dedicatedWorkspaces.delete(data.dedWs);
         scheduleTimeout(120, () => {
             let wsMgr = global.workspace_manager;
             let targetWs = data.origWs;
@@ -728,6 +886,7 @@ function trackWindow(win) {
     if (!win || win.window_type !== Meta.WindowType.NORMAL || trackedWindows.has(win)) {
         return;
     }
+    enforceDedicatedWorkspaceExclusivity(win);
     updateSavedRects(win);
 
     let ids = [
@@ -736,6 +895,7 @@ function trackWindow(win) {
         win.connect("notify::fullscreen", () => onWindowFullscreenChanged(win)),
         win.connect("position-changed", () => scheduleRectUpdate(win)),
         win.connect("size-changed", () => scheduleRectUpdate(win)),
+        win.connect("workspace-changed", () => enforceDedicatedWorkspaceExclusivity(win)),
         win.connect("unmanaged", () => onWindowUnmanaged(win))
     ];
     trackedWindows.set(win, ids);
@@ -789,14 +949,26 @@ function enable() {
         if (win) trackWindow(win);
     }
 
-    globalSignals.push(
-        global.display.connect("window-created", (display, win) => {
-            scheduleTimeout(80, () => trackWindow(win));
+    globalSignals.push({
+        obj: global.display,
+        id: global.display.connect("window-created", (display, win) => {
+            enforceDedicatedWorkspaceExclusivity(win);
+            scheduleTimeout(60, () => {
+                enforceDedicatedWorkspaceExclusivity(win);
+                trackWindow(win);
+            });
         })
-    );
-    globalSignals.push(
-        global.window_manager.connect("switch-workspace", () => onWorkspaceSwitched())
-    );
+    });
+    globalSignals.push({
+        obj: global.display,
+        id: global.display.connect("window-workspace-changed", (display, win, ws) => {
+            enforceDedicatedWorkspaceExclusivity(win);
+        })
+    });
+    globalSignals.push({
+        obj: global.window_manager,
+        id: global.window_manager.connect("switch-workspace", () => onWorkspaceSwitched())
+    });
 
     registerHotkeys();
     refreshFloatingBarPoller();
@@ -809,13 +981,16 @@ function disable() {
     clearAllTimeouts();
     try { Main.keybindingManager.removeHotKey(UUID + "-exit"); } catch (e) {}
 
-    for (let id of globalSignals) {
-        try { global.display.disconnect(id); } catch (e) {}
-        try { global.window_manager.disconnect(id); } catch (e) {}
+    for (let sig of globalSignals) {
+        try { sig.obj.disconnect(sig.id); } catch (e) {}
     }
     globalSignals = [];
 
     for (let win of Array.from(trackedWindows.keys())) {
+        if (win._macDedicated) {
+            exitDedicatedWorkspace(win);
+        }
         untrackWindow(win);
     }
+    dedicatedWorkspaces.clear();
 }

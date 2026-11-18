@@ -10,6 +10,10 @@ On macOS, clicking a window's fullscreen button moves that application into its 
 
 - **Click Maximize / Restore Button (`⬜` / `❐`):**
   - Appends a new dedicated workspace at the end of your workspace list, moves only that window there, switches to it, and puts the window into fullscreen (or maximized) mode with panels hidden.
+- **Automatic Application-Named Workspace:**
+  - The newly created workspace is automatically named after the application (e.g. *Google Chrome*, *Visual Studio Code*, *Terminal*), displaying clearly in the Cinnamon workspace switcher and Expo overview.
+- **Strict Workspace Exclusivity:**
+  - The dedicated workspace is reserved exclusively for that single application. Any other applications opened or moved while in this space are automatically redirected to your normal workspace, preserving complete focus. (App dialogs, popups, and modal sheets belonging to the application remain fully accessible inside the space).
 - **Double-Click the Titlebar:**
   - Keeps native Cinnamon behavior and toggles Maximize inside the **current** workspace.
 - **Preserves Previous Window State (Normal or Maximized):**
