@@ -19,6 +19,18 @@
     "description": "Auto-resync window geometry when switching back to a dedicated workspace",
     "tooltip": "Fixes X11 fractional scaling offset or clipping when returning to a dedicated workspace."
   },
+  "floating-topbar": {
+    "type": "switch",
+    "default": true,
+    "description": "Show floating top bar on hover in Fullscreen mode",
+    "tooltip": "Reveals a macOS-style top bar with window title and controls when moving the cursor to the top edge of the screen."
+  },
+  "floating-topbar-skip-custom": {
+    "type": "switch",
+    "default": true,
+    "description": "Hide floating top bar for apps with custom titlebars",
+    "tooltip": "Automatically disables the floating top bar for apps that draw their own titlebar in fullscreen (such as Chrome and VS Code)."
+  },
   "header-timing": {
     "type": "header",
     "description": "Timing & Fractional Scaling Tuning"
