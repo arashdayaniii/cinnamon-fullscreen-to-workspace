@@ -10,8 +10,8 @@ const Cinnamon = imports.gi.Cinnamon;
 const UUID = "cinnamon-fullscreen-to-workspace@arashdayaniii";
 
 let extSettings = null;
-let trackedWindows = new Map();
-let dedicatedWorkspaces = new Map();
+var trackedWindows = new Map();
+var dedicatedWorkspaces = new Map();
 let globalSignals = [];
 let activeTimeouts = new Set();
 let wmPrefs = null;
@@ -58,7 +58,7 @@ function clearAllTimeouts() {
 }
 
 function isWindowAlive(win) {
-    return win && trackedWindows.has(win);
+    return win && !win.unmanaged && trackedWindows.has(win);
 }
 
 function getWmPrefs() {
@@ -148,9 +148,9 @@ function isPointerOnMaximizeButton(rect) {
     let scale = getScaleFactor();
     let { side, idx } = getButtonLayoutInfo();
 
-    let inY = (py >= rect.y - 6 * scale && py <= rect.y + 56 * scale);
-    let minD = Math.max(0, (idx * 24 - 2) * scale);
-    let maxD = ((idx + 1) * 34 + 8) * scale;
+    let inY = (py >= rect.y - 10 * scale && py <= rect.y + 60 * scale);
+    let minD = Math.max(0, (idx * 20 - 4) * scale);
+    let maxD = ((idx + 1) * 54 + 12) * scale;
 
     let dist = (side === "right")
         ? (rect.x + rect.width) - px
@@ -198,7 +198,7 @@ function isNormalState(win) {
 }
 
 function updateSavedRects(win) {
-    if (!isWindowAlive(win) || win._macBusy || win._macDedicated) return;
+    if (!win || win.unmanaged || win._macBusy || win._macDedicated) return;
     let r = win.get_frame_rect();
     if (!r || r.width <= 50 || r.height <= 50) return;
 
@@ -741,7 +741,8 @@ function exitDedicatedWorkspace(win) {
     scheduleTimeout(preDelay, () => {
         if (!isWindowAlive(win)) return;
         win.change_workspace(targetWs);
-        targetWs.activate_with_focus(win, global.get_current_time());
+        targetWs.activate(global.get_current_time());
+        win.activate(global.get_current_time());
 
         scheduleTimeout(cfg.settleDelay, () => {
             if (!isWindowAlive(win)) return;
@@ -849,13 +850,15 @@ function onWindowMaximizeChanged(win) {
 
     if (!win._macDedicated) {
         if (isFullMax && !win.is_fullscreen()) {
-            if (isPointerOnMaximizeButton(win._macNormalRect)) {
+            let rect = win._macNormalRect || win.get_frame_rect();
+            if (isPointerOnMaximizeButton(rect)) {
                 enterDedicatedWorkspace(win, false);
             } else {
                 scheduleTimeout(70, () => updateSavedRects(win));
             }
-        } else if (!isFullMax && !win.is_fullscreen() && win._macMaxRect) {
-            if (isPointerOnMaximizeButton(win._macMaxRect)) {
+        } else if (!isFullMax && !win.is_fullscreen()) {
+            let rect = win._macMaxRect || getWorkAreaRect(win);
+            if (isPointerOnMaximizeButton(rect)) {
                 enterDedicatedWorkspace(win, true);
             }
         }
@@ -909,16 +912,6 @@ function trackWindow(win) {
         return;
     }
     
-    let currentWs = win.get_workspace();
-    if (currentWs) {
-        let dedWin = getDedicatedWindowForWorkspace(currentWs);
-        if (dedWin && dedWin !== win && !isChildOrDialogOf(win, dedWin)) {
-            onWindowAddedToDedicated(currentWs, win, dedWin);
-        }
-    }
-
-    updateSavedRects(win);
-
     let ids = [
         win.connect("notify::maximized-horizontally", () => onWindowMaximizeChanged(win)),
         win.connect("notify::minimized", () => onWindowMinimizedChanged(win)),
@@ -928,6 +921,16 @@ function trackWindow(win) {
         win.connect("unmanaged", () => onWindowUnmanaged(win))
     ];
     trackedWindows.set(win, ids);
+
+    updateSavedRects(win);
+
+    let currentWs = win.get_workspace();
+    if (currentWs) {
+        let dedWin = getDedicatedWindowForWorkspace(currentWs);
+        if (dedWin && dedWin !== win && !isChildOrDialogOf(win, dedWin)) {
+            onWindowAddedToDedicated(currentWs, win, dedWin);
+        }
+    }
 }
 
 function untrackWindow(win) {
