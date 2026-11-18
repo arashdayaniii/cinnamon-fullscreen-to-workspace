@@ -315,44 +315,52 @@ function getNonDedicatedWorkspace(preferredWs) {
     return wsMgr.append_new_workspace(false, global.get_current_time());
 }
 
-function enforceDedicatedWorkspaceExclusivity(win) {
-    if (!win || win._macRelocating) return;
+function isWindowValid(win) {
     try {
-        if (win.is_on_all_workspaces()) return;
+        if (!win || win.unmanaged) return false;
+        let actor = win.get_compositor_private();
+        if (!actor) return false;
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function onWindowAddedToDedicated(ws, addedWin, dedicatedWin) {
+    if (!addedWin || addedWin === dedicatedWin) return;
+    try {
+        if (addedWin.is_on_all_workspaces()) return;
     } catch (e) {
         return;
     }
+    if (isChildOrDialogOf(addedWin, dedicatedWin)) return;
 
-    let ws = null;
-    try {
-        ws = win.get_workspace();
-    } catch (e) {}
-    if (!ws) return;
+    logDebug(`Disallowed window '${addedWin.get_title()}' (class=${addedWin.get_wm_class()}) added to dedicated workspace '${Main.getWorkspaceName(ws.index())}'. Ejecting...`);
 
-    let dedicatedWin = getDedicatedWindowForWorkspace(ws);
-    if (!dedicatedWin) return;
+    scheduleTimeout(30, () => {
+        if (!addedWin || !isWindowValid(addedWin)) return;
+        let currentWs = null;
+        try { currentWs = addedWin.get_workspace(); } catch (e) {}
+        if (!currentWs || currentWs !== ws) return;
 
-    if (win === dedicatedWin) return;
-    if (isChildOrDialogOf(win, dedicatedWin)) return;
+        let origWs = dedicatedWin._macDedicated ? dedicatedWin._macDedicated.origWs : null;
+        let targetWs = getNonDedicatedWorkspace(origWs);
 
-    win._macRelocating = true;
-    try {
-        let targetWs = getNonDedicatedWorkspace(dedicatedWin._macDedicated ? dedicatedWin._macDedicated.origWs : null);
-        logDebug(`Ejecting win='${win.get_title()}' from dedicated workspace '${Main.getWorkspaceName(ws.index())}' to workspace ${targetWs.index()}`);
+        addedWin.change_workspace(targetWs);
 
-        win.change_workspace(targetWs);
-
-        let activeWs = global.workspace_manager.get_active_workspace();
+        let wsMgr = global.workspace_manager;
+        let activeWs = wsMgr.get_active_workspace();
         if (activeWs === ws) {
-            targetWs.activate_with_focus(win, global.get_current_time());
+            targetWs.activate(global.get_current_time());
+            scheduleTimeout(50, () => {
+                try {
+                    if (isWindowValid(addedWin)) {
+                        addedWin.activate(global.get_current_time());
+                    }
+                } catch (e) {}
+            });
         }
-    } catch (e) {
-        logDebug(`Error ejecting window: ${e}`);
-    } finally {
-        scheduleTimeout(100, () => {
-            if (win) delete win._macRelocating;
-        });
-    }
+    });
 }
 
 function removeWorkspaceIfEmpty(ws, fallbackWs) {
@@ -676,10 +684,15 @@ function enterDedicatedWorkspace(win, wasMaximized) {
         logDebug(`Failed to set workspace name: ${e}`);
     }
 
+    win._macDedicated.wsSignalId = newWs.connect("window-added", (ws, addedWin) => {
+        onWindowAddedToDedicated(ws, addedWin, win);
+    });
+
     scheduleTimeout(preDelay, () => {
         if (!isWindowAlive(win) || !win._macDedicated) return;
         win.change_workspace(newWs);
-        newWs.activate_with_focus(win, global.get_current_time());
+        newWs.activate(global.get_current_time());
+        win.activate(global.get_current_time());
 
         scheduleTimeout(cfg.settleDelay, () => {
             applyTargetPresentation(win, useFullscreen);
@@ -690,6 +703,11 @@ function enterDedicatedWorkspace(win, wasMaximized) {
 function exitDedicatedWorkspace(win) {
     let data = win._macDedicated;
     if (!data) return;
+
+    if (data.wsSignalId && data.dedWs) {
+        try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
+        data.wsSignalId = 0;
+    }
 
     if (topBarWindow === win) {
         destroyTopBar();
@@ -867,6 +885,10 @@ function onWindowUnmanaged(win) {
     let data = win._macDedicated;
     win._macDedicated = null;
     if (data) {
+        if (data.wsSignalId && data.dedWs) {
+            try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
+            data.wsSignalId = 0;
+        }
         if (data.dedWs) dedicatedWorkspaces.delete(data.dedWs);
         scheduleTimeout(120, () => {
             let wsMgr = global.workspace_manager;
@@ -886,7 +908,15 @@ function trackWindow(win) {
     if (!win || win.window_type !== Meta.WindowType.NORMAL || trackedWindows.has(win)) {
         return;
     }
-    enforceDedicatedWorkspaceExclusivity(win);
+    
+    let currentWs = win.get_workspace();
+    if (currentWs) {
+        let dedWin = getDedicatedWindowForWorkspace(currentWs);
+        if (dedWin && dedWin !== win && !isChildOrDialogOf(win, dedWin)) {
+            onWindowAddedToDedicated(currentWs, win, dedWin);
+        }
+    }
+
     updateSavedRects(win);
 
     let ids = [
@@ -895,7 +925,6 @@ function trackWindow(win) {
         win.connect("notify::fullscreen", () => onWindowFullscreenChanged(win)),
         win.connect("position-changed", () => scheduleRectUpdate(win)),
         win.connect("size-changed", () => scheduleRectUpdate(win)),
-        win.connect("workspace-changed", () => enforceDedicatedWorkspaceExclusivity(win)),
         win.connect("unmanaged", () => onWindowUnmanaged(win))
     ];
     trackedWindows.set(win, ids);
@@ -952,17 +981,7 @@ function enable() {
     globalSignals.push({
         obj: global.display,
         id: global.display.connect("window-created", (display, win) => {
-            enforceDedicatedWorkspaceExclusivity(win);
-            scheduleTimeout(60, () => {
-                enforceDedicatedWorkspaceExclusivity(win);
-                trackWindow(win);
-            });
-        })
-    });
-    globalSignals.push({
-        obj: global.display,
-        id: global.display.connect("window-workspace-changed", (display, win, ws) => {
-            enforceDedicatedWorkspaceExclusivity(win);
+            scheduleTimeout(80, () => trackWindow(win));
         })
     });
     globalSignals.push({
@@ -985,6 +1004,13 @@ function disable() {
         try { sig.obj.disconnect(sig.id); } catch (e) {}
     }
     globalSignals = [];
+
+    for (let [ws, win] of dedicatedWorkspaces.entries()) {
+        if (win && win._macDedicated && win._macDedicated.wsSignalId) {
+            try { ws.disconnect(win._macDedicated.wsSignalId); } catch (e) {}
+            win._macDedicated.wsSignalId = 0;
+        }
+    }
 
     for (let win of Array.from(trackedWindows.keys())) {
         if (win._macDedicated) {
