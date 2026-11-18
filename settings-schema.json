@@ -1,0 +1,65 @@
+{
+  "header-behavior": {
+    "type": "header",
+    "description": "Workspace & Presentation Behavior"
+  },
+  "mode": {
+    "type": "combobox",
+    "default": "fullscreen",
+    "description": "Dedicated workspace presentation mode",
+    "tooltip": "Fullscreen hides panels and titlebar automatically. Maximize keeps window buttons and works best with Cinnamon's 'Intelligently hide panel' option.",
+    "options": {
+      "Fullscreen (True fullscreen, panels auto-hidden)": "fullscreen",
+      "Maximize (Keep titlebar buttons + use smart panel hide)": "maximize"
+    }
+  },
+  "resync-on-switch": {
+    "type": "switch",
+    "default": true,
+    "description": "Auto-resync window geometry when switching back to a dedicated workspace",
+    "tooltip": "Fixes X11 fractional scaling offset or clipping when returning to a dedicated workspace."
+  },
+  "header-timing": {
+    "type": "header",
+    "description": "Timing & Fractional Scaling Tuning"
+  },
+  "settle-delay": {
+    "type": "spinbutton",
+    "default": 100,
+    "min": 0,
+    "max": 600,
+    "step": 10,
+    "units": "ms",
+    "description": "Workspace settle delay",
+    "tooltip": "Delay after switching workspaces before resizing the window. Use 0 ms on 100% display scale; 100-250 ms works well on fractional scaling (e.g. 125%)."
+  },
+  "restore-maximize-delay": {
+    "type": "spinbutton",
+    "default": 0,
+    "min": 0,
+    "max": 400,
+    "step": 10,
+    "units": "ms",
+    "description": "Restore maximize delay",
+    "tooltip": "Delay between resetting the window frame and re-maximizing when returning a previously maximized window to its original workspace."
+  },
+  "header-shortcuts": {
+    "type": "header",
+    "description": "Keyboard Shortcuts"
+  },
+  "exit-hotkey": {
+    "type": "keybinding",
+    "default": "<Super><Shift>f",
+    "description": "Exit dedicated workspace",
+    "tooltip": "Returns the focused window to its original workspace and restores its previous state/geometry."
+  },
+  "header-debug": {
+    "type": "header",
+    "description": "Diagnostics"
+  },
+  "enable-logs": {
+    "type": "switch",
+    "default": false,
+    "description": "Enable debug logging in ~/.xsession-errors"
+  }
+}

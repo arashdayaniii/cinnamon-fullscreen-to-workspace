@@ -1,0 +1,7 @@
+{
+  "uuid": "cinnamon-fullscreen-to-workspace@arashdayaniii",
+  "name": "Cinnamon Fullscreen To Workspace",
+  "description": "Sends windows to a dedicated fullscreen workspace when clicking the maximize button, while preserving titlebar double-click maximize in the current workspace.",
+  "cinnamon-version": ["6.0", "6.2", "6.4", "6.6"],
+  "version": "1.0.0"
+}
