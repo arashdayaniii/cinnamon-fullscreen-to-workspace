@@ -270,6 +270,164 @@ function getWindowAppName(win) {
     return "App";
 }
 
+const IDE_SPECS = [
+    { match: /rider/i, defaultIdeName: "Rider" },
+    { match: /idea|intellij/i, defaultIdeName: "IntelliJ IDEA" },
+    { match: /pycharm/i, defaultIdeName: "PyCharm" },
+    { match: /webstorm/i, defaultIdeName: "WebStorm" },
+    { match: /clion/i, defaultIdeName: "CLion" },
+    { match: /goland/i, defaultIdeName: "GoLand" },
+    { match: /rubymine/i, defaultIdeName: "RubyMine" },
+    { match: /phpstorm/i, defaultIdeName: "PhpStorm" },
+    { match: /datagrip/i, defaultIdeName: "DataGrip" },
+    { match: /rustrover/i, defaultIdeName: "RustRover" },
+    { match: /fleet/i, defaultIdeName: "Fleet" },
+    { match: /android.*studio/i, defaultIdeName: "Android Studio" },
+    { match: /visual-studio-code|code-oss|code|vscodium|vscode/i, defaultIdeName: "VS Code" },
+    { match: /cursor/i, defaultIdeName: "Cursor" },
+    { match: /windsurf/i, defaultIdeName: "Windsurf" },
+    { match: /antigravity/i, defaultIdeName: "Antigravity" },
+    { match: /sublime/i, defaultIdeName: "Sublime Text" },
+    { match: /eclipse/i, defaultIdeName: "Eclipse" },
+    { match: /qtcreator/i, defaultIdeName: "Qt Creator" },
+    { match: /netbeans/i, defaultIdeName: "NetBeans" },
+    { match: /zed/i, defaultIdeName: "Zed" },
+    { match: /atom/i, defaultIdeName: "Atom" },
+    { match: /kate/i, defaultIdeName: "Kate" },
+    { match: /kdevelop/i, defaultIdeName: "KDevelop" },
+    { match: /geany/i, defaultIdeName: "Geany" }
+];
+
+function getWorkspaceTitleForWindow(win) {
+    if (!win) return "App";
+
+    let appName = "";
+    try {
+        let tracker = Cinnamon.WindowTracker.get_default();
+        let app = tracker.get_window_app(win);
+        if (app) {
+            let name = app.get_name();
+            if (name && name.trim().length > 0) appName = name.trim();
+        }
+    } catch (e) {}
+
+    let wmClass = "";
+    try {
+        let c = win.get_wm_class();
+        if (c && c.trim().length > 0) wmClass = c.trim();
+    } catch (e) {}
+
+    let title = "";
+    try {
+        let t = win.get_title();
+        if (t && t.trim().length > 0) title = t.trim();
+    } catch (e) {}
+
+    let fullId = `${appName} ${wmClass}`.toLowerCase();
+
+    let matchedIde = null;
+    for (let spec of IDE_SPECS) {
+        if (spec.match.test(fullId)) {
+            matchedIde = spec.defaultIdeName;
+            break;
+        }
+    }
+
+    if (!matchedIde && fullId.indexOf("jetbrains") !== -1) {
+        matchedIde = "JetBrains";
+    }
+
+    if (!matchedIde) {
+        return getWindowAppName(win);
+    }
+
+    let ideDisplay = matchedIde;
+    if (appName && appName.length > 1 && !appName.toLowerCase().endsWith(".py")) {
+        let lowerApp = appName.toLowerCase();
+        if (lowerApp !== "code" && lowerApp !== "code-oss" && lowerApp !== "jetbrains-rider" && lowerApp !== "antigravity") {
+            ideDisplay = appName;
+        }
+    }
+    if (matchedIde && ideDisplay.toLowerCase() === matchedIde.toLowerCase()) {
+        ideDisplay = matchedIde;
+    }
+
+    if (!title) {
+        return ideDisplay;
+    }
+
+    if (/^(welcome|get started|welcome to)/i.test(title)) {
+        return ideDisplay;
+    }
+
+    let cleanT = title.replace(/^[●*•]\s*/, "").trim();
+    cleanT = cleanT.replace(/^\[Extension Development Host\]\s*[-—–]?\s*/i, "").trim();
+
+    let project = null;
+    let isJetBrains = /rider|idea|intellij|pycharm|webstorm|clion|goland|rubymine|phpstorm|datagrip|rustrover|fleet|jetbrains/i.test(fullId) ||
+                      /android.*studio/i.test(fullId);
+
+    if (isJetBrains) {
+        let bracketMatch = cleanT.match(/^\[([^\]]+)\]/);
+        if (bracketMatch) {
+            project = bracketMatch[1].trim();
+        } else if (cleanT.indexOf("[") !== -1) {
+            let beforeBracket = cleanT.split("[")[0].trim();
+            beforeBracket = beforeBracket.replace(/[\s–—-]+$/, "").trim();
+            if (beforeBracket) {
+                project = beforeBracket;
+            }
+        } else {
+            let parts = cleanT.split(/\s+[—–-]\s+/).map(p => p.trim()).filter(p => p.length > 0);
+            if (parts.length > 0) {
+                let first = parts[0];
+                if (first.toLowerCase() !== ideDisplay.toLowerCase() && first.toLowerCase() !== appName.toLowerCase()) {
+                    project = first;
+                }
+            }
+        }
+    } else {
+        let parts = cleanT.split(/\s+[—–-]\s+/).map(p => p.trim()).filter(p => p.length > 0);
+
+        if (parts.length >= 2) {
+            let last = parts[parts.length - 1];
+            let isLastIde = /code|studio|sublime|eclipse|cursor|antigravity|zed|creator/i.test(last) ||
+                            (last.toLowerCase() === ideDisplay.toLowerCase());
+            if (isLastIde) {
+                let cand = parts[parts.length - 2];
+                cand = cand.replace(/\s*\((Workspace|SSH:[^)]+)\)/i, "").trim();
+                cand = cand.replace(/\s*\[[^\]]+\]/g, "").trim();
+                if (cand.indexOf("•") !== -1) {
+                    let sub = cand.split("•");
+                    cand = sub[sub.length - 1].trim();
+                }
+                if (cand && !/^(welcome|get started)$/i.test(cand)) {
+                    project = cand;
+                }
+            } else {
+                let first = parts[0];
+                if (!/\.[a-zA-Z0-9]{1,6}$/.test(first)) {
+                    project = first;
+                }
+            }
+        } else if (parts.length === 1) {
+            let cand = parts[0];
+            if (cand.toLowerCase() !== ideDisplay.toLowerCase() && cand.toLowerCase() !== appName.toLowerCase()) {
+                project = cand;
+            }
+        }
+    }
+
+    if (project && project.toLowerCase() !== ideDisplay.toLowerCase()) {
+        project = project.replace(/^[\s–—-]+|[\s–—-]+$/g, "").trim();
+        if (project.length > 0) {
+            return `${project} - ${ideDisplay}`;
+        }
+    }
+
+    return ideDisplay;
+}
+
 function getDedicatedWindowForWorkspace(ws) {
     if (!ws) return null;
     let win = dedicatedWorkspaces.get(ws);
@@ -707,11 +865,12 @@ function enterDedicatedWorkspace(win, wasMaximized) {
     win._macDedicated.dedWs = newWs;
     dedicatedWorkspaces.set(newWs, win);
 
-    let appName = getWindowAppName(win);
-    win._macDedicated.appName = appName;
+    let wsName = getWorkspaceTitleForWindow(win);
+    win._macDedicated.appName = wsName;
+    win._macDedicated.wsName = wsName;
     try {
-        Main.setWorkspaceName(newWs.index(), appName);
-        logDebug(`enter: workspace ${newWs.index()} named '${appName}'`);
+        Main.setWorkspaceName(newWs.index(), wsName);
+        logDebug(`enter: workspace ${newWs.index()} named '${wsName}'`);
     } catch (e) {
         logDebug(`Failed to set workspace name: ${e}`);
     }
@@ -940,6 +1099,22 @@ function onWindowUnmanaged(win) {
     untrackWindow(win);
 }
 
+function onWindowTitleChanged(win) {
+    if (!win || !win._macDedicated || win._macDedicated.isExiting) return;
+    let dedWs = win._macDedicated.dedWs;
+    if (!dedWs) return;
+
+    let newName = getWorkspaceTitleForWindow(win);
+    if (newName && newName !== win._macDedicated.wsName) {
+        win._macDedicated.wsName = newName;
+        win._macDedicated.appName = newName;
+        try {
+            Main.setWorkspaceName(dedWs.index(), newName);
+            logDebug(`workspace ${dedWs.index()} title updated to '${newName}'`);
+        } catch (e) {}
+    }
+}
+
 function trackWindow(win) {
     if (!win || win.window_type !== Meta.WindowType.NORMAL || trackedWindows.has(win)) {
         return;
@@ -949,6 +1124,7 @@ function trackWindow(win) {
         win.connect("notify::maximized-horizontally", () => onWindowMaximizeChanged(win)),
         win.connect("notify::minimized", () => onWindowMinimizedChanged(win)),
         win.connect("notify::fullscreen", () => onWindowFullscreenChanged(win)),
+        win.connect("notify::title", () => onWindowTitleChanged(win)),
         win.connect("position-changed", () => scheduleRectUpdate(win)),
         win.connect("size-changed", () => scheduleRectUpdate(win)),
         win.connect("unmanaged", () => onWindowUnmanaged(win))
@@ -982,16 +1158,43 @@ function untrackWindow(win) {
     trackedWindows.delete(win);
 }
 
+function toggleDedicatedWorkspace() {
+    let activeWs = global.workspace_manager.get_active_workspace();
+    let dedWin = activeWs ? getDedicatedWindowForWorkspace(activeWs) : null;
+    let focusWin = global.display.focus_window;
+
+    if (dedWin) {
+        if (!dedWin._macBusy) {
+            exitDedicatedWorkspace(dedWin);
+        }
+        return;
+    }
+
+    if (focusWin && focusWin._macDedicated) {
+        if (!focusWin._macBusy) {
+            exitDedicatedWorkspace(focusWin);
+        }
+        return;
+    }
+
+    if (focusWin && !focusWin.unmanaged && focusWin.window_type === Meta.WindowType.NORMAL) {
+        if (!trackedWindows.has(focusWin)) {
+            trackWindow(focusWin);
+        }
+        if (!focusWin._macBusy) {
+            let wasMaximized = (focusWin.get_maximized() === Meta.MaximizeFlags.BOTH);
+            enterDedicatedWorkspace(focusWin, wasMaximized);
+        }
+    }
+}
+
 function registerHotkeys() {
     try { Main.keybindingManager.removeHotKey(UUID + "-exit"); } catch (e) {}
 
-    let exitKeys = (cfg.exitHotkey || "").split("::").filter(k => k && k.trim());
-    if (exitKeys.length > 0) {
-        Main.keybindingManager.addHotKey(UUID + "-exit", exitKeys[0], () => {
-            let win = global.display.focus_window;
-            if (win && win._macDedicated && !win._macBusy) {
-                exitDedicatedWorkspace(win);
-            }
+    let keys = (cfg.exitHotkey || "").split("::").filter(k => k && k.trim());
+    if (keys.length > 0) {
+        Main.keybindingManager.addHotKey(UUID + "-exit", keys[0], () => {
+            toggleDedicatedWorkspace();
         });
     }
 }

@@ -10,8 +10,9 @@ On macOS, clicking a window's fullscreen button moves that application into its 
 
 - **Click Maximize / Restore Button (`⬜` / `❐`):**
   - Appends a new dedicated workspace at the end of your workspace list, moves only that window there, switches to it, and puts the window into fullscreen (or maximized) mode with panels hidden.
-- **Automatic Application-Named Workspace:**
-  - The newly created workspace is automatically named after the application (e.g. *Google Chrome*, *Visual Studio Code*, *Terminal*), displaying clearly in the Cinnamon workspace switcher and Expo overview.
+- **Automatic Application & Project-Named Workspace:**
+  - The newly created workspace is automatically named after the application (e.g. *Google Chrome*, *Terminal*).
+  - For IDEs and code editors with project windows (e.g. *JetBrains Rider*, *IntelliJ IDEA*, *PyCharm*, *VS Code*, *Cursor*, *Sublime Text*, etc.), the workspace is dynamically named with the **Project Name - IDE Name** (e.g. *Vyly - Rider*, *my-project - Visual Studio Code*), keeping multiple project windows clearly organized in the Cinnamon workspace switcher and Expo overview.
 - **Strict Workspace Exclusivity:**
   - The dedicated workspace is reserved exclusively for that single application. Any other applications opened or moved while in this space are automatically redirected to your normal workspace, preserving complete focus. (App dialogs, popups, and modal sheets belonging to the application remain fully accessible inside the space).
 - **Double-Click the Titlebar:**
@@ -46,11 +47,13 @@ git clone https://github.com/arashdayaniii/cinnamon-fullscreen-to-workspace.git 
 
 ## Usage
 
-- **Send a window to a dedicated fullscreen workspace:** Click the **Maximize / Restore** button in the window titlebar.
+- **Send a window to a dedicated fullscreen workspace:**
+  - Click the **Maximize / Restore** button in the window titlebar, or
+  - Press the toggle hotkey **`Super + Shift + F`** while focused on the window.
 - **Maximize in the current workspace:** Double-click the draggable area of the window titlebar.
 - **Switch between workspaces:** Use `Ctrl + Alt + Left/Right Arrow` (or your configured workspace shortcuts).
 - **Return to the original workspace:**
-  - Press **`Super + Shift + F`** (works across all applications), or
+  - Press **`Super + Shift + F`** (acts as a toggle across all applications), or
   - Use the application's native fullscreen shortcut (`F11` or `Alt + F11`), or
   - Minimize or close the window.
 
@@ -83,9 +86,9 @@ Open **Extensions → Cinnamon Fullscreen To Workspace → Configure (gear icon)
 - **Range:** `0 ms` – `400 ms` *(Default: `0 ms`)*
 - **Why it exists:** When returning a window that was **already maximized** before entering its dedicated space, the extension first resets the window frame cleanly inside the original workspace's work area (`move_resize_frame`) before re-applying `maximize()`. On some systems with fractional scaling, calling `maximize()` immediately after resetting geometry can leave a slight horizontal offset; adding a small delay (e.g., `50–100 ms`) prevents that. Keep it at `0 ms` if it already restores cleanly on your system.
 
-### 5. Exit dedicated workspace (`exit-hotkey`)
+### 5. Toggle dedicated workspace (`exit-hotkey`)
 - **Default:** `Shift + Super + F`
-- **Why it exists:** True fullscreen mode hides the window's titlebar buttons, and not every application supports `F11`. This global shortcut provides one consistent key combination to exit fullscreen and return any focused window to its original workspace.
+- **Why it exists:** Provides one consistent global key combination to toggle dedicated workspaces: pressing it moves the focused window into its own dedicated fullscreen workspace, and pressing it again returns the window back to its original workspace.
 
 ### 6. Enable debug logging in `~/.xsession-errors` (`enable-logs`)
 - **Default:** `Disabled`

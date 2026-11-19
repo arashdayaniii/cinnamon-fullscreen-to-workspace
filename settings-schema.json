@@ -62,8 +62,8 @@
   "exit-hotkey": {
     "type": "keybinding",
     "default": "<Super><Shift>f",
-    "description": "Exit dedicated workspace",
-    "tooltip": "Returns the focused window to its original workspace and restores its previous state/geometry."
+    "description": "Toggle dedicated workspace (Open / Exit)",
+    "tooltip": "Sends the focused window to a dedicated workspace, or returns it to its original workspace if already in one."
   },
   "header-debug": {
     "type": "header",
