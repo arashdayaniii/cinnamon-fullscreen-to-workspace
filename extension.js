@@ -2,9 +2,6 @@ const Main = imports.ui.main;
 const Settings = imports.ui.settings;
 const Meta = imports.gi.Meta;
 const GLib = imports.gi.GLib;
-const Gio = imports.gi.Gio;
-const St = imports.gi.St;
-const Clutter = imports.gi.Clutter;
 const Cinnamon = imports.gi.Cinnamon;
 
 const UUID = "cinnamon-fullscreen-to-workspace@arashdayaniii";
@@ -14,19 +11,9 @@ var trackedWindows = new Map();
 var dedicatedWorkspaces = new Map();
 let globalSignals = [];
 let activeTimeouts = new Set();
-let wmPrefs = null;
-
-let topBar = null;
-let topBarWindow = null;
-let topBarVisible = false;
-let barPollTimer = 0;
-let barHideTimer = 0;
 
 let cfg = {
-    mode: "fullscreen",
     resyncOnSwitch: true,
-    floatingTopbar: true,
-    floatingTopbarSkipCustom: true,
     settleDelay: 100,
     restoreMaximizeDelay: 0,
     exitHotkey: "<Super><Shift>f",
@@ -59,106 +46,6 @@ function clearAllTimeouts() {
 
 function isWindowAlive(win) {
     return win && !win.unmanaged && trackedWindows.has(win);
-}
-
-function getWmPrefs() {
-    if (!wmPrefs) {
-        wmPrefs = new Gio.Settings({ schema_id: "org.cinnamon.desktop.wm.preferences" });
-    }
-    return wmPrefs;
-}
-
-function getParsedButtonLayout() {
-    let layout = ":minimize,maximize,close";
-    try {
-        let val = getWmPrefs().get_string("button-layout");
-        if (val && val.length > 0) {
-            layout = val;
-        }
-    } catch (e) {}
-
-    let parts = layout.split(":");
-    let leftPart = parts[0] || "";
-    let rightPart = parts[1] || "";
-
-    let leftBtns = leftPart.split(",").map(s => s.trim()).filter(s => s && s !== "spacer");
-    let rightBtns = rightPart.split(",").map(s => s.trim()).filter(s => s && s !== "spacer");
-
-    return { leftBtns: leftBtns, rightBtns: rightBtns };
-}
-
-function getButtonLayoutInfo() {
-    let { leftBtns, rightBtns } = getParsedButtonLayout();
-
-    let isRtl = false;
-    try {
-        isRtl = (Clutter.get_default_text_direction() === Clutter.TextDirection.RTL);
-    } catch (e) {}
-
-    if (isRtl) {
-        let tmp = leftBtns.slice().reverse();
-        leftBtns = rightBtns.slice().reverse();
-        rightBtns = tmp;
-    }
-
-    let rIdx = rightBtns.indexOf("maximize");
-    if (rIdx !== -1) {
-        return { side: "right", idx: rightBtns.length - 1 - rIdx };
-    }
-    let lIdx = leftBtns.indexOf("maximize");
-    if (lIdx !== -1) {
-        return { side: "left", idx: lIdx };
-    }
-    return { side: "right", idx: 1 };
-}
-
-function getScaleFactor() {
-    try {
-        return Math.max(1, St.ThemeContext.get_for_stage(global.stage).scale_factor || 1);
-    } catch (e) {
-        return 1;
-    }
-}
-
-function hasCustomTitlebar(win) {
-    if (!win) return false;
-    let clientDecorated = false;
-    let decorated = true;
-
-    try {
-        if (typeof win.is_client_decorated === "function") {
-            clientDecorated = !!win.is_client_decorated();
-        }
-    } catch (e) {}
-
-    try {
-        if ("decorated" in win) {
-            decorated = !!win.decorated;
-        }
-    } catch (e) {}
-
-    let result = clientDecorated || !decorated;
-    logDebug(`titlebarCheck title='${win.get_title()}' decorated=${decorated} clientDecorated=${clientDecorated} custom=${result}`);
-    return result;
-}
-
-function isPointerOnMaximizeButton(rect) {
-    if (!rect) return false;
-    let [px, py] = global.get_pointer();
-    let scale = getScaleFactor();
-    let { side, idx } = getButtonLayoutInfo();
-
-    let inY = (py >= rect.y - 10 * scale && py <= rect.y + 60 * scale);
-    let minD = Math.max(0, (idx * 20 - 4) * scale);
-    let maxD = ((idx + 1) * 54 + 12) * scale;
-
-    let dist = (side === "right")
-        ? (rect.x + rect.width) - px
-        : px - rect.x;
-
-    let matched = inY && (dist >= minD && dist <= maxD);
-    logDebug(`click ptr=(${px},${py}) rect=(${rect.x},${rect.y},${rect.width},${rect.height}) scale=${scale} dist=${dist} range=[${minD},${maxD}] inY=${inY} matched=${matched}`);
-    return matched;
 }
 
 function copyRect(r) {
@@ -512,7 +399,7 @@ function onWindowAddedToDedicated(ws, addedWin, dedicatedWin) {
     }
     if (isChildOrDialogOf(addedWin, dedicatedWin)) return;
 
-    logDebug(`Disallowed window '${addedWin.get_title()}' (class=${addedWin.get_wm_class()}) added to dedicated workspace '${Main.getWorkspaceName(ws.index())}'. Ejecting...`);
+    logDebug(`Disallowed window '${addedWin.get_title()}' added to dedicated workspace '${Main.getWorkspaceName(ws.index())}'. Ejecting...`);
 
     scheduleTimeout(30, () => {
         if (!addedWin || !isWindowValid(addedWin)) return;
@@ -566,248 +453,16 @@ function removeWorkspaceIfEmpty(ws, fallbackWs) {
     }
 }
 
-function cancelBarHideTimer() {
-    if (barHideTimer) {
-        try { GLib.source_remove(barHideTimer); } catch (e) {}
-        barHideTimer = 0;
-    }
-}
-
-function destroyTopBar() {
-    cancelBarHideTimer();
-    if (topBar) {
-        try { Main.layoutManager.removeChrome(topBar); } catch (e) {}
-        try { topBar.destroy(); } catch (e) {}
-        topBar = null;
-    }
-    topBarVisible = false;
-    topBarWindow = null;
-}
-
-function hideTopBar() {
-    cancelBarHideTimer();
-    if (topBar && topBarVisible) {
-        topBar.hide();
-        topBarVisible = false;
-    }
-}
-
-function createBarButton(kind, win) {
-    let iconName = "window-restore-symbolic";
-    let hoverBg = "rgba(255, 255, 255, 0.16)";
-    if (kind === "minimize") {
-        iconName = "window-minimize-symbolic";
-    } else if (kind === "close") {
-        iconName = "window-close-symbolic";
-        hoverBg = "rgba(220, 53, 69, 0.85)";
-    }
-
-    let baseStyle = "border-radius: 6px; padding: 4px 8px; margin: 0 2px; background-color: transparent;";
-    let hoverStyle = `border-radius: 6px; padding: 4px 8px; margin: 0 2px; background-color: ${hoverBg};`;
-
-    let icon = new St.Icon({
-        icon_name: iconName,
-        icon_size: 14,
-        style: "color: #f2f2f2;"
-    });
-
-    let btn = new St.Button({
-        child: icon,
-        reactive: true,
-        can_focus: false,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: baseStyle
-    });
-
-    btn.connect("enter-event", () => {
-        btn.set_style(hoverStyle);
-    });
-    btn.connect("leave-event", () => {
-        btn.set_style(baseStyle);
-    });
-    btn.connect("clicked", () => {
-        hideTopBar();
-        if (!isWindowAlive(win)) return;
-        if (kind === "minimize") {
-            win.minimize();
-        } else if (kind === "maximize") {
-            exitDedicatedWorkspace(win);
-        } else if (kind === "close") {
-            win.delete(global.get_current_time());
-        }
-    });
-
-    return btn;
-}
-
-function buildTopBarForWindow(win) {
-    destroyTopBar();
-    if (!isWindowAlive(win)) return;
-
-    let mon = getMonitorRect(win);
-    let scale = getScaleFactor();
-    let barHeight = Math.round(34 * scale);
-
-    topBar = new St.BoxLayout({
-        vertical: false,
-        reactive: true,
-        track_hover: true,
-        text_direction: Clutter.TextDirection.LTR,
-        style: "background-color: rgba(24, 24, 28, 0.94); border-bottom: 1px solid rgba(255, 255, 255, 0.12); padding: 0 10px;"
-    });
-
-    let { leftBtns, rightBtns } = getParsedButtonLayout();
-    let validKinds = new Set(["minimize", "maximize", "close"]);
-
-    let leftBox = new St.BoxLayout({
-        vertical: false,
-        y_align: Clutter.ActorAlign.CENTER
-    });
-    for (let k of leftBtns) {
-        if (validKinds.has(k)) leftBox.add_child(createBarButton(k, win));
-    }
-
-    let titleLabel = new St.Label({
-        text: win.get_title() || "",
-        x_expand: true,
-        x_align: Clutter.ActorAlign.CENTER,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: "color: #ececec; font-size: 12px; font-weight: bold; padding: 0 12px;"
-    });
-
-    let rightBox = new St.BoxLayout({
-        vertical: false,
-        y_align: Clutter.ActorAlign.CENTER
-    });
-    for (let k of rightBtns) {
-        if (validKinds.has(k)) rightBox.add_child(createBarButton(k, win));
-    }
-
-    topBar.add_child(leftBox);
-    topBar.add_child(titleLabel);
-    topBar.add_child(rightBox);
-
-    topBar.set_position(mon.x, mon.y);
-    topBar.set_size(mon.width, barHeight);
-    topBar.hide();
-
-    Main.layoutManager.addChrome(topBar, {
-        visibleInFullscreen: true,
-        affectsStruts: false,
-        affectsInputRegion: true
-    });
-
-    topBarWindow = win;
-    topBarVisible = false;
-}
-
-function shouldShowFloatingBarFor(win) {
-    if (!cfg.floatingTopbar) return false;
-    if (!isWindowAlive(win) || !win._macDedicated) return false;
-    if (!win._macDedicated.useFullscreen || !win.is_fullscreen()) return false;
-    if (cfg.floatingTopbarSkipCustom && win._macDedicated.customTitlebar) return false;
-    return true;
-}
-
-function getActiveDedicatedBarCandidate() {
-    let activeWs = global.workspace_manager.get_active_workspace();
-    if (!activeWs) return null;
-
-    let focusWin = global.display.focus_window;
-    if (focusWin && focusWin.get_workspace() === activeWs && shouldShowFloatingBarFor(focusWin)) {
-        return focusWin;
-    }
-
-    for (let win of trackedWindows.keys()) {
-        if (win.get_workspace() === activeWs && shouldShowFloatingBarFor(win)) {
-            return win;
-        }
-    }
-    return null;
-}
-
-function pollFloatingBar() {
-    let win = getActiveDedicatedBarCandidate();
-    if (!win) {
-        hideTopBar();
-        stopBarPoller();
-        return GLib.SOURCE_REMOVE;
-    }
-
-    let mon = getMonitorRect(win);
-    let scale = getScaleFactor();
-    let barHeight = Math.round(34 * scale);
-    let [px, py] = global.get_pointer();
-    let insideX = (px >= mon.x && px < mon.x + mon.width);
-
-    if (!topBarVisible) {
-        if (insideX && py >= mon.y && py <= mon.y + Math.max(4, 3 * scale)) {
-            if (!topBar || topBarWindow !== win) {
-                buildTopBarForWindow(win);
-            } else {
-                topBar.set_position(mon.x, mon.y);
-                topBar.set_size(mon.width, barHeight);
-            }
-            cancelBarHideTimer();
-            if (topBar) {
-                topBar.show();
-                topBarVisible = true;
-            }
-        }
-    } else {
-        let nearTop = insideX && (py >= mon.y && py <= mon.y + barHeight + 12 * scale);
-        if (nearTop || (topBar && topBar.hover)) {
-            cancelBarHideTimer();
-        } else if (!barHideTimer) {
-            barHideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 180, () => {
-                barHideTimer = 0;
-                hideTopBar();
-                return GLib.SOURCE_REMOVE;
-            });
-        }
-    }
-
-    return GLib.SOURCE_CONTINUE;
-}
-
-function startBarPoller() {
-    if (barPollTimer) return;
-    barPollTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 90, pollFloatingBar);
-}
-
-function stopBarPoller() {
-    if (barPollTimer) {
-        try { GLib.source_remove(barPollTimer); } catch (e) {}
-        barPollTimer = 0;
-    }
-}
-
-function refreshFloatingBarPoller() {
-    let win = getActiveDedicatedBarCandidate();
-    if (win) {
-        startBarPoller();
-    } else {
-        hideTopBar();
-        stopBarPoller();
-    }
-}
-
-function applyTargetPresentation(win, useFullscreen) {
+function applyTargetPresentation(win) {
     if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-    let targetRect = useFullscreen ? getMonitorRect(win) : getWorkAreaRect(win);
+    let targetRect = getMonitorRect(win);
     let postSnapDelay = cfg.settleDelay > 0 ? 70 : 10;
 
     win.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
 
     scheduleTimeout(postSnapDelay, () => {
         if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-        if (useFullscreen) {
-            if (!win.is_fullscreen()) win.make_fullscreen();
-        } else {
-            if (win.get_maximized() !== Meta.MaximizeFlags.BOTH) {
-                win.maximize(Meta.MaximizeFlags.BOTH);
-            }
-        }
+        if (!win.is_fullscreen()) win.make_fullscreen();
 
         let actor = win.get_compositor_private();
         if (actor) actor.queue_redraw();
@@ -816,8 +471,7 @@ function applyTargetPresentation(win, useFullscreen) {
         scheduleTimeout(180, () => {
             if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
                 win._macBusy = false;
-                refreshFloatingBarPoller();
-                logDebug(`entered mode=${useFullscreen ? "fullscreen" : "maximize"} frame=${JSON.stringify(win.get_frame_rect())}`);
+                logDebug(`entered fullscreen frame=${JSON.stringify(win.get_frame_rect())}`);
             }
         });
     });
@@ -828,9 +482,7 @@ function enterDedicatedWorkspace(win, wasMaximized) {
     let origWs = win.get_workspace();
     if (!origWs) return;
 
-    let useFullscreen = (cfg.mode === "fullscreen");
     let preDelay = cfg.settleDelay > 0 ? 100 : 15;
-    let customTitlebar = hasCustomTitlebar(win);
 
     let normalRect = null;
     if (win._macNormalRect && !isMatchingWorkAreaOrScreen(win._macNormalRect, win)) {
@@ -847,14 +499,12 @@ function enterDedicatedWorkspace(win, wasMaximized) {
     win._macDedicated = {
         origWs: origWs,
         wasMaximized: wasMaximized,
-        useFullscreen: useFullscreen,
-        customTitlebar: customTitlebar,
         normalRect: normalRect,
         isExiting: false,
         timerId: 0
     };
 
-    logDebug(`enter start wasMax=${wasMaximized} mode=${cfg.mode} customBar=${customTitlebar} normalRect=${JSON.stringify(win._macDedicated.normalRect)}`);
+    logDebug(`enter start wasMax=${wasMaximized} normalRect=${JSON.stringify(win._macDedicated.normalRect)}`);
 
     if (win.get_maximized() !== 0) {
         win.unmaximize(Meta.MaximizeFlags.BOTH);
@@ -887,7 +537,7 @@ function enterDedicatedWorkspace(win, wasMaximized) {
 
         win._macDedicated.timerId = scheduleTimeout(cfg.settleDelay, () => {
             if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-            applyTargetPresentation(win, useFullscreen);
+            applyTargetPresentation(win);
         });
     });
 }
@@ -906,13 +556,6 @@ function exitDedicatedWorkspace(win) {
         try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
         data.wsSignalId = 0;
     }
-
-    if (topBarWindow === win) {
-        destroyTopBar();
-    } else {
-        hideTopBar();
-    }
-    stopBarPoller();
 
     win._macBusy = true;
     let preDelay = cfg.settleDelay > 0 ? 90 : 15;
@@ -985,7 +628,6 @@ function exitDedicatedWorkspace(win) {
                 win._macBusy = false;
                 win._macDedicated = null;
                 updateSavedRects(win);
-                refreshFloatingBarPoller();
                 logDebug(`exit done frame=${JSON.stringify(win.get_frame_rect())} max=${win.get_maximized()}`);
             }
         });
@@ -994,15 +636,9 @@ function exitDedicatedWorkspace(win) {
 
 function resyncDedicatedWindow(win) {
     if (!isWindowAlive(win) || !win._macDedicated || win._macBusy || win._macDedicated.isExiting) return;
-    let data = win._macDedicated;
-    let useFullscreen = data.useFullscreen;
     let preDelay = cfg.settleDelay > 0 ? 80 : 10;
     win._macBusy = true;
 
-    // Do not trust frame_rect alone here. Cinnamon/Muffin can report a frame
-    // matching the monitor while the fullscreen surface is still visually
-    // displaced or clipped (notably with fractional scaling). Reapply the
-    // known-good presentation sequence used by the first version instead.
     logDebug(`resyncing win='${win.get_title()}'`);
 
     if (win.is_fullscreen()) win.unmake_fullscreen();
@@ -1010,15 +646,12 @@ function resyncDedicatedWindow(win) {
 
     scheduleTimeout(preDelay, () => {
         if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
-            applyTargetPresentation(win, useFullscreen);
+            applyTargetPresentation(win);
         }
     });
 }
 
 function onWorkspaceSwitched() {
-    hideTopBar();
-    refreshFloatingBarPoller();
-
     if (!cfg.resyncOnSwitch) return;
     let switchDelay = cfg.settleDelay > 0 ? 160 : 20;
     scheduleTimeout(switchDelay, () => {
@@ -1030,33 +663,12 @@ function onWorkspaceSwitched() {
                 resyncDedicatedWindow(dedWin);
             }
         }
-        refreshFloatingBarPoller();
     });
 }
 
 function onWindowMaximizeChanged(win) {
-    if (win._macBusy) return;
-    let isFullMax = (win.get_maximized() === Meta.MaximizeFlags.BOTH);
-
-    if (!win._macDedicated) {
-        if (isFullMax && !win.is_fullscreen()) {
-            let rect = (win._macNormalRect && !isMatchingWorkAreaOrScreen(win._macNormalRect, win))
-                ? win._macNormalRect
-                : win.get_frame_rect();
-            if (isPointerOnMaximizeButton(rect) || isPointerOnMaximizeButton(win.get_frame_rect())) {
-                enterDedicatedWorkspace(win, false);
-            } else {
-                scheduleTimeout(70, () => updateSavedRects(win));
-            }
-        } else if (!isFullMax && !win.is_fullscreen()) {
-            let rect = win._macMaxRect || getWorkAreaRect(win);
-            if (isPointerOnMaximizeButton(rect) || isPointerOnMaximizeButton(getWorkAreaRect(win))) {
-                enterDedicatedWorkspace(win, true);
-            }
-        }
-    } else if (!win._macDedicated.useFullscreen && !isFullMax && !win.is_fullscreen()) {
-        exitDedicatedWorkspace(win);
-    }
+    if (win._macBusy || win._macDedicated) return;
+    scheduleTimeout(70, () => updateSavedRects(win));
 }
 
 function onWindowMinimizedChanged(win) {
@@ -1068,15 +680,12 @@ function onWindowMinimizedChanged(win) {
 
 function onWindowFullscreenChanged(win) {
     if (win._macBusy) return;
-    if (win._macDedicated && win._macDedicated.useFullscreen && !win.is_fullscreen()) {
+    if (win._macDedicated && !win.is_fullscreen()) {
         exitDedicatedWorkspace(win);
     }
 }
 
 function onWindowUnmanaged(win) {
-    if (topBarWindow === win) {
-        destroyTopBar();
-    }
     let data = win._macDedicated;
     win._macDedicated = null;
     if (data) {
@@ -1093,7 +702,6 @@ function onWindowUnmanaged(win) {
             }
             if (targetWs) targetWs.activate(global.get_current_time());
             removeWorkspaceIfEmpty(data.dedWs, targetWs);
-            refreshFloatingBarPoller();
         });
     }
     untrackWindow(win);
@@ -1201,10 +809,7 @@ function registerHotkeys() {
 
 function init(metadata) {
     extSettings = new Settings.ExtensionSettings(cfg, metadata.uuid);
-    extSettings.bind("mode", "mode");
     extSettings.bind("resync-on-switch", "resyncOnSwitch");
-    extSettings.bind("floating-topbar", "floatingTopbar", refreshFloatingBarPoller);
-    extSettings.bind("floating-topbar-skip-custom", "floatingTopbarSkipCustom", refreshFloatingBarPoller);
     extSettings.bind("settle-delay", "settleDelay");
     extSettings.bind("restore-maximize-delay", "restoreMaximizeDelay");
     extSettings.bind("exit-hotkey", "exitHotkey", registerHotkeys);
@@ -1229,13 +834,10 @@ function enable() {
     });
 
     registerHotkeys();
-    refreshFloatingBarPoller();
     logDebug("Extension enabled");
 }
 
 function disable() {
-    stopBarPoller();
-    destroyTopBar();
     clearAllTimeouts();
     try { Main.keybindingManager.removeHotKey(UUID + "-exit"); } catch (e) {}
 

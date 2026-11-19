@@ -1,35 +1,13 @@
 {
   "header-behavior": {
     "type": "header",
-    "description": "Workspace & Presentation Behavior"
-  },
-  "mode": {
-    "type": "combobox",
-    "default": "fullscreen",
-    "description": "Dedicated workspace presentation mode",
-    "tooltip": "Fullscreen hides panels and titlebar automatically. Maximize keeps window buttons and works best with Cinnamon's 'Intelligently hide panel' option.",
-    "options": {
-      "Fullscreen (True fullscreen, panels auto-hidden)": "fullscreen",
-      "Maximize (Keep titlebar buttons + use smart panel hide)": "maximize"
-    }
+    "description": "Workspace Behavior"
   },
   "resync-on-switch": {
     "type": "switch",
     "default": true,
     "description": "Auto-resync window geometry when switching back to a dedicated workspace",
     "tooltip": "Fixes X11 fractional scaling offset or clipping when returning to a dedicated workspace."
-  },
-  "floating-topbar": {
-    "type": "switch",
-    "default": true,
-    "description": "Show floating top bar on hover in Fullscreen mode",
-    "tooltip": "Reveals a macOS-style top bar with window title and controls when moving the cursor to the top edge of the screen."
-  },
-  "floating-topbar-skip-custom": {
-    "type": "switch",
-    "default": true,
-    "description": "Hide floating top bar for apps with custom titlebars",
-    "tooltip": "Automatically disables the floating top bar for apps that draw their own titlebar in fullscreen (such as Chrome and VS Code)."
   },
   "header-timing": {
     "type": "header",
