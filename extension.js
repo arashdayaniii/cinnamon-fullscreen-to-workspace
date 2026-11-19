@@ -197,13 +197,32 @@ function isNormalState(win) {
     return win.get_maximized() === 0 && !win.is_fullscreen() && !win.minimized;
 }
 
+function isMatchingWorkAreaOrScreen(r, win) {
+    if (!r || typeof r.x !== "number" || typeof r.y !== "number" ||
+        typeof r.width !== "number" || typeof r.height !== "number") {
+        return true;
+    }
+    if (r.width <= 100 || r.height <= 100) return true;
+    let wa = getWorkAreaRect(win);
+    let mon = getMonitorRect(win);
+    if (r.width >= mon.width && r.height >= mon.height) return true;
+    if (r.width >= wa.width - 4 && r.height >= wa.height - 4) return true;
+    return false;
+}
+
 function updateSavedRects(win) {
     if (!win || win.unmanaged || win._macBusy || win._macDedicated) return;
+    let currentWs = null;
+    try { currentWs = win.get_workspace(); } catch (e) {}
+    if (currentWs && dedicatedWorkspaces.has(currentWs)) return;
+
     let r = win.get_frame_rect();
     if (!r || r.width <= 50 || r.height <= 50) return;
 
     if (isNormalState(win)) {
-        win._macNormalRect = copyRect(r);
+        if (!isMatchingWorkAreaOrScreen(r, win)) {
+            win._macNormalRect = copyRect(r);
+        }
     } else if (win.get_maximized() === Meta.MaximizeFlags.BOTH && !win.is_fullscreen()) {
         win._macMaxRect = copyRect(r);
     }
@@ -616,14 +635,14 @@ function refreshFloatingBarPoller() {
 }
 
 function applyTargetPresentation(win, useFullscreen) {
-    if (!isWindowAlive(win)) return;
+    if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
     let targetRect = useFullscreen ? getMonitorRect(win) : getWorkAreaRect(win);
     let postSnapDelay = cfg.settleDelay > 0 ? 70 : 10;
 
-    win.move_resize_frame(true, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+    win.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
 
     scheduleTimeout(postSnapDelay, () => {
-        if (!isWindowAlive(win)) return;
+        if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
         if (useFullscreen) {
             if (!win.is_fullscreen()) win.make_fullscreen();
         } else {
@@ -637,7 +656,7 @@ function applyTargetPresentation(win, useFullscreen) {
         win.activate(global.get_current_time());
 
         scheduleTimeout(180, () => {
-            if (isWindowAlive(win)) {
+            if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
                 win._macBusy = false;
                 refreshFloatingBarPoller();
                 logDebug(`entered mode=${useFullscreen ? "fullscreen" : "maximize"} frame=${JSON.stringify(win.get_frame_rect())}`);
@@ -655,13 +674,26 @@ function enterDedicatedWorkspace(win, wasMaximized) {
     let preDelay = cfg.settleDelay > 0 ? 100 : 15;
     let customTitlebar = hasCustomTitlebar(win);
 
+    let normalRect = null;
+    if (win._macNormalRect && !isMatchingWorkAreaOrScreen(win._macNormalRect, win)) {
+        normalRect = copyRect(win._macNormalRect);
+    } else if (!wasMaximized) {
+        let fr = win.get_frame_rect();
+        if (fr && !isMatchingWorkAreaOrScreen(fr, win)) {
+            normalRect = copyRect(fr);
+            win._macNormalRect = copyRect(fr);
+        }
+    }
+
     win._macBusy = true;
     win._macDedicated = {
         origWs: origWs,
         wasMaximized: wasMaximized,
         useFullscreen: useFullscreen,
         customTitlebar: customTitlebar,
-        normalRect: win._macNormalRect ? copyRect(win._macNormalRect) : null
+        normalRect: normalRect,
+        isExiting: false,
+        timerId: 0
     };
 
     logDebug(`enter start wasMax=${wasMaximized} mode=${cfg.mode} customBar=${customTitlebar} normalRect=${JSON.stringify(win._macDedicated.normalRect)}`);
@@ -688,13 +720,14 @@ function enterDedicatedWorkspace(win, wasMaximized) {
         onWindowAddedToDedicated(ws, addedWin, win);
     });
 
-    scheduleTimeout(preDelay, () => {
-        if (!isWindowAlive(win) || !win._macDedicated) return;
+    win._macDedicated.timerId = scheduleTimeout(preDelay, () => {
+        if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
         win.change_workspace(newWs);
         newWs.activate(global.get_current_time());
         win.activate(global.get_current_time());
 
-        scheduleTimeout(cfg.settleDelay, () => {
+        win._macDedicated.timerId = scheduleTimeout(cfg.settleDelay, () => {
+            if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
             applyTargetPresentation(win, useFullscreen);
         });
     });
@@ -702,7 +735,13 @@ function enterDedicatedWorkspace(win, wasMaximized) {
 
 function exitDedicatedWorkspace(win) {
     let data = win._macDedicated;
-    if (!data) return;
+    if (!data || data.isExiting) return;
+    data.isExiting = true;
+
+    if (data.timerId) {
+        try { GLib.source_remove(data.timerId); activeTimeouts.delete(data.timerId); } catch (e) {}
+        data.timerId = 0;
+    }
 
     if (data.wsSignalId && data.dedWs) {
         try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
@@ -716,21 +755,10 @@ function exitDedicatedWorkspace(win) {
     }
     stopBarPoller();
 
-    win._macDedicated = null;
     win._macBusy = true;
-    let preDelay = cfg.settleDelay > 0 ? 110 : 15;
+    let preDelay = cfg.settleDelay > 0 ? 90 : 15;
 
     logDebug(`exit start wasMax=${data.wasMaximized} normalRect=${JSON.stringify(data.normalRect)}`);
-
-    if (win.minimized) {
-        win.unminimize();
-    }
-    if (win.is_fullscreen()) {
-        win.unmake_fullscreen();
-    }
-    if (win.get_maximized() !== 0) {
-        win.unmaximize(Meta.MaximizeFlags.BOTH);
-    }
 
     let wsMgr = global.workspace_manager;
     let targetWs = data.origWs;
@@ -738,15 +766,29 @@ function exitDedicatedWorkspace(win) {
         targetWs = wsMgr.get_workspace_by_index(0);
     }
 
-    scheduleTimeout(preDelay, () => {
-        if (!isWindowAlive(win)) return;
-        win.change_workspace(targetWs);
-        targetWs.activate(global.get_current_time());
-        win.activate(global.get_current_time());
+    win.change_workspace(targetWs);
+    targetWs.activate(global.get_current_time());
+    win.activate(global.get_current_time());
 
-        scheduleTimeout(cfg.settleDelay, () => {
-            if (!isWindowAlive(win)) return;
+    if (win.minimized) {
+        win.unminimize();
+    }
+    if (win.is_fullscreen()) {
+        win.unmake_fullscreen();
+    }
 
+    data.timerId = scheduleTimeout(preDelay, () => {
+        if (!isWindowAlive(win)) {
+            removeWorkspaceIfEmpty(data.dedWs, targetWs);
+            dedicatedWorkspaces.delete(data.dedWs);
+            return;
+        }
+
+        if (data.wasMaximized) {
+            if (win.get_maximized() !== Meta.MaximizeFlags.BOTH) {
+                win.maximize(Meta.MaximizeFlags.BOTH);
+            }
+        } else {
             if (win.get_maximized() !== 0) {
                 win.unmaximize(Meta.MaximizeFlags.BOTH);
             }
@@ -754,54 +796,45 @@ function exitDedicatedWorkspace(win) {
             let wa = getWorkAreaRect(win);
             let r = data.normalRect;
             let gx, gy, gw, gh;
-            if (r && r.width > 100 && r.height > 100) {
-                gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 100));
-                gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 100));
+
+            if (r && r.width >= 100 && r.height >= 100 && !isMatchingWorkAreaOrScreen(r, win)) {
+                gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
+                gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
                 gw = Math.min(r.width, wa.width);
                 gh = Math.min(r.height, wa.height);
             } else {
-                gx = wa.x + Math.round(wa.width * 0.05);
-                gy = wa.y + Math.round(wa.height * 0.05);
-                gw = Math.max(400, Math.round(wa.width * 0.9));
-                gh = Math.max(300, Math.round(wa.height * 0.9));
+                gw = Math.min(Math.round(wa.width * 0.75), 1400);
+                gh = Math.min(Math.round(wa.height * 0.75), 900);
+                gx = wa.x + Math.round((wa.width - gw) / 2);
+                gy = wa.y + Math.round((wa.height - gh) / 2);
             }
 
-            win.move_resize_frame(true, gx, gy, gw, gh);
+            win.move_resize_frame(false, gx, gy, gw, gh);
+            win.move_frame(false, gx, gy);
             win._macNormalRect = { x: gx, y: gy, width: gw, height: gh };
+        }
 
-            let finishRestore = () => {
-                if (!isWindowAlive(win)) return;
-                let actor = win.get_compositor_private();
-                if (actor) actor.queue_redraw();
-                win.activate(global.get_current_time());
-                removeWorkspaceIfEmpty(data.dedWs, targetWs);
-                dedicatedWorkspaces.delete(data.dedWs);
+        let actor = win.get_compositor_private();
+        if (actor) actor.queue_redraw();
+        win.activate(global.get_current_time());
 
-                scheduleTimeout(180, () => {
-                    if (isWindowAlive(win)) {
-                        win._macBusy = false;
-                        updateSavedRects(win);
-                        refreshFloatingBarPoller();
-                        logDebug(`exit done frame=${JSON.stringify(win.get_frame_rect())} max=${win.get_maximized()}`);
-                    }
-                });
-            };
+        removeWorkspaceIfEmpty(data.dedWs, targetWs);
+        dedicatedWorkspaces.delete(data.dedWs);
 
-            if (data.wasMaximized) {
-                scheduleTimeout(cfg.restoreMaximizeDelay, () => {
-                    if (!isWindowAlive(win)) return;
-                    win.maximize(Meta.MaximizeFlags.BOTH);
-                    finishRestore();
-                });
-            } else {
-                finishRestore();
+        data.timerId = scheduleTimeout(140, () => {
+            if (isWindowAlive(win)) {
+                win._macBusy = false;
+                win._macDedicated = null;
+                updateSavedRects(win);
+                refreshFloatingBarPoller();
+                logDebug(`exit done frame=${JSON.stringify(win.get_frame_rect())} max=${win.get_maximized()}`);
             }
         });
     });
 }
 
 function resyncDedicatedWindow(win) {
-    if (!isWindowAlive(win) || !win._macDedicated || win._macBusy) return;
+    if (!isWindowAlive(win) || !win._macDedicated || win._macBusy || win._macDedicated.isExiting) return;
     let data = win._macDedicated;
     let useFullscreen = data.useFullscreen;
     let preDelay = cfg.settleDelay > 0 ? 80 : 10;
@@ -817,7 +850,7 @@ function resyncDedicatedWindow(win) {
     if (win.get_maximized() !== 0) win.unmaximize(Meta.MaximizeFlags.BOTH);
 
     scheduleTimeout(preDelay, () => {
-        if (isWindowAlive(win) && win._macDedicated) {
+        if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
             applyTargetPresentation(win, useFullscreen);
         }
     });
@@ -831,13 +864,11 @@ function onWorkspaceSwitched() {
     let switchDelay = cfg.settleDelay > 0 ? 160 : 20;
     scheduleTimeout(switchDelay, () => {
         let activeWs = global.workspace_manager.get_active_workspace();
-        if (!activeWs) return;
-        for (let win of trackedWindows.keys()) {
-            if (win._macDedicated && !win._macBusy) {
-                let ws = win.get_workspace();
-                if (ws && ws === activeWs) {
-                    resyncDedicatedWindow(win);
-                }
+        if (!activeWs || !dedicatedWorkspaces.has(activeWs)) return;
+        let dedWin = dedicatedWorkspaces.get(activeWs);
+        if (dedWin && isWindowAlive(dedWin) && dedWin._macDedicated && !dedWin._macBusy && !dedWin._macDedicated.isExiting) {
+            if (dedWin._macDedicated.dedWs === activeWs && dedWin.get_workspace() === activeWs) {
+                resyncDedicatedWindow(dedWin);
             }
         }
         refreshFloatingBarPoller();
@@ -850,15 +881,17 @@ function onWindowMaximizeChanged(win) {
 
     if (!win._macDedicated) {
         if (isFullMax && !win.is_fullscreen()) {
-            let rect = win._macNormalRect || win.get_frame_rect();
-            if (isPointerOnMaximizeButton(rect)) {
+            let rect = (win._macNormalRect && !isMatchingWorkAreaOrScreen(win._macNormalRect, win))
+                ? win._macNormalRect
+                : win.get_frame_rect();
+            if (isPointerOnMaximizeButton(rect) || isPointerOnMaximizeButton(win.get_frame_rect())) {
                 enterDedicatedWorkspace(win, false);
             } else {
                 scheduleTimeout(70, () => updateSavedRects(win));
             }
         } else if (!isFullMax && !win.is_fullscreen()) {
             let rect = win._macMaxRect || getWorkAreaRect(win);
-            if (isPointerOnMaximizeButton(rect)) {
+            if (isPointerOnMaximizeButton(rect) || isPointerOnMaximizeButton(getWorkAreaRect(win))) {
                 enterDedicatedWorkspace(win, true);
             }
         }
