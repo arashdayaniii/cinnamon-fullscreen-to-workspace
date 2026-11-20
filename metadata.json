@@ -1,7 +1,7 @@
 {
   "uuid": "cinnamon-fullscreen-to-workspace@arashdayaniii",
   "name": "Cinnamon Fullscreen To Workspace",
-  "description": "Sends windows to a dedicated fullscreen workspace using a global keyboard shortcut, keeping workspaces clean and focused.",
+  "description": "macOS-style Dual-Workspace Architecture with dedicated fullscreen App Spaces, edge-hover panel reveal, window isolation, and Expo drag-and-drop workspace reordering.",
   "cinnamon-version": ["6.0", "6.2", "6.4", "6.6"],
-  "version": "1.1.0"
+  "version": "2.0.0"
 }

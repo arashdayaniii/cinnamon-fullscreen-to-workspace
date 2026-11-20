@@ -1,16 +1,45 @@
+// -*- mode: js; js-indent-level: 4; indent-tabs-mode: nil -*-
+/**
+ * Cinnamon Fullscreen To Workspace
+ * Dual-Workspace Architecture (NORMAL vs APP_SPACE) for Cinnamon 6.0 - 6.6+ on X11
+ */
+
 const Main = imports.ui.main;
 const Settings = imports.ui.settings;
 const Meta = imports.gi.Meta;
+const Clutter = imports.gi.Clutter;
+const St = imports.gi.St;
 const GLib = imports.gi.GLib;
 const Cinnamon = imports.gi.Cinnamon;
+const DND = imports.ui.dnd;
+const ExpoThumbnail = imports.ui.expoThumbnail;
+const Panel = imports.ui.panel;
 
 const UUID = "cinnamon-fullscreen-to-workspace@arashdayaniii";
 
 let extSettings = null;
-var trackedWindows = new Map();
-var dedicatedWorkspaces = new Map();
-let globalSignals = [];
 let activeTimeouts = new Set();
+let globalSignals = [];
+
+// Dual-Workspace State: Map keyed by Meta.Workspace reference
+// Value: { ownerWindow, returnWorkspace, appName, wasMaximized, savedFloatingRect, isExiting, wsSignalId }
+const appSpaces = new Map();
+
+// Window Tracking: Map keyed by Meta.Window reference -> array of signal connection IDs
+const trackedWindows = new Map();
+
+// Edge trigger actors and backups for panel hover reveal
+let edgeTriggers = [];
+const panelStateBackups = new Map();
+
+// Original prototypes and methods backup for clean restoration on disable
+let origExpoThumbnailInit = null;
+let origExpoRefreshTitle = null;
+let origExpoOnTitleKeyPress = null;
+let origExpoHandleDragOverOrDrop = null;
+let origExpoRemove = null;
+let origGetWorkspaceName = null;
+let origHasDefaultWorkspaceName = null;
 
 let cfg = {
     resyncOnSwitch: true,
@@ -45,10 +74,11 @@ function clearAllTimeouts() {
 }
 
 function isWindowAlive(win) {
-    return win && !win.unmanaged && trackedWindows.has(win);
+    return win && !win.unmanaged;
 }
 
 function copyRect(r) {
+    if (!r) return { x: 0, y: 0, width: 800, height: 600 };
     return { x: r.x, y: r.y, width: r.width, height: r.height };
 }
 
@@ -60,13 +90,11 @@ function getMonitorRect(win) {
             return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
         }
     } catch (e) {}
-
     try {
         let monIdx = win.get_monitor();
         let m = Main.layoutManager.monitors[monIdx];
         if (m) return { x: m.x, y: m.y, width: m.width, height: m.height };
     } catch (e) {}
-
     return { x: 0, y: 0, width: global.screen_width, height: global.screen_height };
 }
 
@@ -81,56 +109,22 @@ function getWorkAreaRect(win) {
 }
 
 function isNormalState(win) {
-    return win.get_maximized() === 0 && !win.is_fullscreen() && !win.minimized;
+    return isWindowAlive(win) && win.get_maximized() === 0 && !win.is_fullscreen() && !win.minimized;
 }
 
-function isMatchingWorkAreaOrScreen(r, win) {
-    if (!r || typeof r.x !== "number" || typeof r.y !== "number" ||
-        typeof r.width !== "number" || typeof r.height !== "number") {
-        return true;
-    }
-    if (r.width <= 100 || r.height <= 100) return true;
-    let wa = getWorkAreaRect(win);
-    let mon = getMonitorRect(win);
-    if (r.width >= mon.width && r.height >= mon.height) return true;
-    if (r.width >= wa.width - 4 && r.height >= wa.height - 4) return true;
-    return false;
-}
+function updateSavedFloatingRect(win) {
+    if (!isWindowAlive(win) || !isNormalState(win)) return;
+    let ws = null;
+    try { ws = win.get_workspace(); } catch (e) {}
+    if (ws && appSpaces.has(ws)) return;
 
-function updateSavedRects(win) {
-    if (!win || win.unmanaged || win._macBusy || win._macDedicated) return;
-    let currentWs = null;
-    try { currentWs = win.get_workspace(); } catch (e) {}
-    if (currentWs && dedicatedWorkspaces.has(currentWs)) return;
-
-    let r = win.get_frame_rect();
-    if (!r || r.width <= 50 || r.height <= 50) return;
-
-    if (isNormalState(win)) {
-        if (!isMatchingWorkAreaOrScreen(r, win)) {
-            win._macNormalRect = copyRect(r);
-        }
-    } else if (win.get_maximized() === Meta.MaximizeFlags.BOTH && !win.is_fullscreen()) {
-        win._macMaxRect = copyRect(r);
+    let fr = win.get_frame_rect();
+    if (fr && fr.width > 100 && fr.height > 100) {
+        win._savedFloatingRect = copyRect(fr);
     }
 }
 
-function scheduleRectUpdate(win) {
-    if (!isWindowAlive(win) || win._macBusy || win._macDedicated) return;
-    if (win._macRectTimer) {
-        try {
-            GLib.source_remove(win._macRectTimer);
-            activeTimeouts.delete(win._macRectTimer);
-        } catch (e) {}
-        win._macRectTimer = 0;
-    }
-    win._macRectTimer = scheduleTimeout(30, () => {
-        if (win) win._macRectTimer = 0;
-        updateSavedRects(win);
-    });
-}
-
-function getWindowAppName(win) {
+function getCleanAppName(win) {
     if (!win) return "App";
     try {
         let tracker = Cinnamon.WindowTracker.get_default();
@@ -157,175 +151,22 @@ function getWindowAppName(win) {
     return "App";
 }
 
-const IDE_SPECS = [
-    { match: /rider/i, defaultIdeName: "Rider" },
-    { match: /idea|intellij/i, defaultIdeName: "IntelliJ IDEA" },
-    { match: /pycharm/i, defaultIdeName: "PyCharm" },
-    { match: /webstorm/i, defaultIdeName: "WebStorm" },
-    { match: /clion/i, defaultIdeName: "CLion" },
-    { match: /goland/i, defaultIdeName: "GoLand" },
-    { match: /rubymine/i, defaultIdeName: "RubyMine" },
-    { match: /phpstorm/i, defaultIdeName: "PhpStorm" },
-    { match: /datagrip/i, defaultIdeName: "DataGrip" },
-    { match: /rustrover/i, defaultIdeName: "RustRover" },
-    { match: /fleet/i, defaultIdeName: "Fleet" },
-    { match: /android.*studio/i, defaultIdeName: "Android Studio" },
-    { match: /visual-studio-code|code-oss|code|vscodium|vscode/i, defaultIdeName: "VS Code" },
-    { match: /cursor/i, defaultIdeName: "Cursor" },
-    { match: /windsurf/i, defaultIdeName: "Windsurf" },
-    { match: /antigravity/i, defaultIdeName: "Antigravity" },
-    { match: /sublime/i, defaultIdeName: "Sublime Text" },
-    { match: /eclipse/i, defaultIdeName: "Eclipse" },
-    { match: /qtcreator/i, defaultIdeName: "Qt Creator" },
-    { match: /netbeans/i, defaultIdeName: "NetBeans" },
-    { match: /zed/i, defaultIdeName: "Zed" },
-    { match: /atom/i, defaultIdeName: "Atom" },
-    { match: /kate/i, defaultIdeName: "Kate" },
-    { match: /kdevelop/i, defaultIdeName: "KDevelop" },
-    { match: /geany/i, defaultIdeName: "Geany" }
-];
-
-function getWorkspaceTitleForWindow(win) {
-    if (!win) return "App";
-
-    let appName = "";
-    try {
-        let tracker = Cinnamon.WindowTracker.get_default();
-        let app = tracker.get_window_app(win);
-        if (app) {
-            let name = app.get_name();
-            if (name && name.trim().length > 0) appName = name.trim();
-        }
-    } catch (e) {}
-
-    let wmClass = "";
-    try {
-        let c = win.get_wm_class();
-        if (c && c.trim().length > 0) wmClass = c.trim();
-    } catch (e) {}
-
-    let title = "";
-    try {
-        let t = win.get_title();
-        if (t && t.trim().length > 0) title = t.trim();
-    } catch (e) {}
-
-    let fullId = `${appName} ${wmClass}`.toLowerCase();
-
-    let matchedIde = null;
-    for (let spec of IDE_SPECS) {
-        if (spec.match.test(fullId)) {
-            matchedIde = spec.defaultIdeName;
-            break;
-        }
-    }
-
-    if (!matchedIde && fullId.indexOf("jetbrains") !== -1) {
-        matchedIde = "JetBrains";
-    }
-
-    if (!matchedIde) {
-        return getWindowAppName(win);
-    }
-
-    let ideDisplay = matchedIde;
-    if (appName && appName.length > 1 && !appName.toLowerCase().endsWith(".py")) {
-        let lowerApp = appName.toLowerCase();
-        if (lowerApp !== "code" && lowerApp !== "code-oss" && lowerApp !== "jetbrains-rider" && lowerApp !== "antigravity") {
-            ideDisplay = appName;
-        }
-    }
-    if (matchedIde && ideDisplay.toLowerCase() === matchedIde.toLowerCase()) {
-        ideDisplay = matchedIde;
-    }
-
-    if (!title) {
-        return ideDisplay;
-    }
-
-    if (/^(welcome|get started|welcome to)/i.test(title)) {
-        return ideDisplay;
-    }
-
-    let cleanT = title.replace(/^[●*•]\s*/, "").trim();
-    cleanT = cleanT.replace(/^\[Extension Development Host\]\s*[-—–]?\s*/i, "").trim();
-
-    let project = null;
-    let isJetBrains = /rider|idea|intellij|pycharm|webstorm|clion|goland|rubymine|phpstorm|datagrip|rustrover|fleet|jetbrains/i.test(fullId) ||
-                      /android.*studio/i.test(fullId);
-
-    if (isJetBrains) {
-        let bracketMatch = cleanT.match(/^\[([^\]]+)\]/);
-        if (bracketMatch) {
-            project = bracketMatch[1].trim();
-        } else if (cleanT.indexOf("[") !== -1) {
-            let beforeBracket = cleanT.split("[")[0].trim();
-            beforeBracket = beforeBracket.replace(/[\s–—-]+$/, "").trim();
-            if (beforeBracket) {
-                project = beforeBracket;
-            }
-        } else {
-            let parts = cleanT.split(/\s+[—–-]\s+/).map(p => p.trim()).filter(p => p.length > 0);
-            if (parts.length > 0) {
-                let first = parts[0];
-                if (first.toLowerCase() !== ideDisplay.toLowerCase() && first.toLowerCase() !== appName.toLowerCase()) {
-                    project = first;
-                }
-            }
-        }
-    } else {
-        let parts = cleanT.split(/\s+[—–-]\s+/).map(p => p.trim()).filter(p => p.length > 0);
-
-        if (parts.length >= 2) {
-            let last = parts[parts.length - 1];
-            let isLastIde = /code|studio|sublime|eclipse|cursor|antigravity|zed|creator/i.test(last) ||
-                            (last.toLowerCase() === ideDisplay.toLowerCase());
-            if (isLastIde) {
-                let cand = parts[parts.length - 2];
-                cand = cand.replace(/\s*\((Workspace|SSH:[^)]+)\)/i, "").trim();
-                cand = cand.replace(/\s*\[[^\]]+\]/g, "").trim();
-                if (cand.indexOf("•") !== -1) {
-                    let sub = cand.split("•");
-                    cand = sub[sub.length - 1].trim();
-                }
-                if (cand && !/^(welcome|get started)$/i.test(cand)) {
-                    project = cand;
-                }
-            } else {
-                let first = parts[0];
-                if (!/\.[a-zA-Z0-9]{1,6}$/.test(first)) {
-                    project = first;
-                }
-            }
-        } else if (parts.length === 1) {
-            let cand = parts[0];
-            if (cand.toLowerCase() !== ideDisplay.toLowerCase() && cand.toLowerCase() !== appName.toLowerCase()) {
-                project = cand;
-            }
-        }
-    }
-
-    if (project && project.toLowerCase() !== ideDisplay.toLowerCase()) {
-        project = project.replace(/^[\s–—-]+|[\s–—-]+$/g, "").trim();
-        if (project.length > 0) {
-            return `${project} - ${ideDisplay}`;
-        }
-    }
-
-    return ideDisplay;
+function isAppSpace(ws) {
+    return ws ? appSpaces.has(ws) : false;
 }
 
-function getDedicatedWindowForWorkspace(ws) {
-    if (!ws) return null;
-    let win = dedicatedWorkspaces.get(ws);
-    if (win && isWindowAlive(win)) return win;
+function getOwnerWindowForWorkspace(ws) {
+    if (!ws || !appSpaces.has(ws)) return null;
+    let data = appSpaces.get(ws);
+    return (data && isWindowAlive(data.ownerWindow)) ? data.ownerWindow : null;
+}
 
-    for (let w of trackedWindows.keys()) {
-        if (w._macDedicated && (w._macDedicated.dedWs === ws || (w._macDedicated.dedWs && w._macDedicated.dedWs.index() === ws.index()))) {
-            return w;
-        }
+function isOwnerInAppSpace(win) {
+    if (!isWindowAlive(win)) return false;
+    for (let data of appSpaces.values()) {
+        if (data.ownerWindow === win && !data.isExiting) return true;
     }
-    return null;
+    return false;
 }
 
 function isChildOrDialogOf(otherWin, parentWin) {
@@ -359,405 +200,366 @@ function isChildOrDialogOf(otherWin, parentWin) {
     return false;
 }
 
-function getNonDedicatedWorkspace(preferredWs) {
+function getNearestNormalWorkspace(preferredWs) {
     let wsMgr = global.workspace_manager;
     let n = wsMgr.get_n_workspaces();
 
-    if (preferredWs && preferredWs.index() >= 0 && preferredWs.index() < n) {
-        if (!getDedicatedWindowForWorkspace(preferredWs)) {
+    if (preferredWs && !appSpaces.has(preferredWs)) {
+        let idx = -1;
+        try { idx = preferredWs.index(); } catch (e) {}
+        if (idx >= 0 && idx < n && wsMgr.get_workspace_by_index(idx) === preferredWs) {
             return preferredWs;
         }
     }
 
-    for (let i = 0; i < n; i++) {
-        let ws = wsMgr.get_workspace_by_index(i);
-        if (!getDedicatedWindowForWorkspace(ws)) {
-            return ws;
+    let centerIdx = (preferredWs && preferredWs.index() >= 0 && preferredWs.index() < n) ?
+        preferredWs.index() :
+        wsMgr.get_active_workspace_index();
+
+    for (let dist = 1; dist < n; dist++) {
+        let left = centerIdx - dist;
+        if (left >= 0) {
+            let ws = wsMgr.get_workspace_by_index(left);
+            if (ws && !appSpaces.has(ws)) return ws;
+        }
+        let right = centerIdx + dist;
+        if (right < n) {
+            let ws = wsMgr.get_workspace_by_index(right);
+            if (ws && !appSpaces.has(ws)) return ws;
         }
     }
 
-    return wsMgr.append_new_workspace(false, global.get_current_time());
+    if (centerIdx >= 0 && centerIdx < n) {
+        let ws = wsMgr.get_workspace_by_index(centerIdx);
+        if (ws && !appSpaces.has(ws)) return ws;
+    }
+
+    // Guarantee that at least one NORMAL workspace always exists
+    let newWs = wsMgr.append_new_workspace(false, global.get_current_time());
+    return newWs;
 }
 
-function isWindowValid(win) {
+function verifyFullscreen(win) {
+    if (!isWindowAlive(win)) return;
+    let mon = getMonitorRect(win);
+    let fr = win.get_frame_rect();
+
+    if (!win.is_fullscreen()) {
+        win.make_fullscreen();
+    }
+
+    if (fr && (fr.x !== mon.x || fr.y !== mon.y || fr.width < mon.width || fr.height < mon.height)) {
+        win.move_resize_frame(false, mon.x, mon.y, mon.width, mon.height);
+        if (!win.is_fullscreen()) {
+            win.make_fullscreen();
+        }
+    }
+
+    let actor = win.get_compositor_private();
+    if (actor) actor.queue_redraw();
+    win.activate(global.get_current_time());
+}
+
+function enterAppSpace(win) {
+    if (!isWindowAlive(win) || win.window_type !== Meta.WindowType.NORMAL) return;
+
+    let origWs = win.get_workspace();
+    if (!origWs) return;
+
+    let wasMaximized = (win.get_maximized() === Meta.MaximizeFlags.BOTH);
+    let floatingRect = null;
+
+    if (!wasMaximized) {
+        let fr = win.get_frame_rect();
+        if (fr && fr.width > 100 && fr.height > 100) {
+            floatingRect = copyRect(fr);
+            win._savedFloatingRect = copyRect(fr);
+        }
+    } else if (win._savedFloatingRect) {
+        floatingRect = copyRect(win._savedFloatingRect);
+    } else {
+        let wa = getWorkAreaRect(win);
+        let gw = Math.min(Math.round(wa.width * 0.75), 1400);
+        let gh = Math.min(Math.round(wa.height * 0.75), 900);
+        floatingRect = {
+            x: wa.x + Math.round((wa.width - gw) / 2),
+            y: wa.y + Math.round((wa.height - gh) / 2),
+            width: gw,
+            height: gh
+        };
+    }
+
+    if (win.get_maximized() !== 0) {
+        win.unmaximize(Meta.MaximizeFlags.BOTH);
+    }
+
+    let wsMgr = global.workspace_manager;
+    let activeIdx = origWs.index();
+    let newWs = wsMgr.append_new_workspace(false, global.get_current_time());
+    wsMgr.reorder_workspace(newWs, activeIdx + 1);
+
+    let appName = getCleanAppName(win);
+
+    let appData = {
+        ownerWindow: win,
+        returnWorkspace: origWs,
+        appName: appName,
+        wasMaximized: wasMaximized,
+        savedFloatingRect: floatingRect,
+        isExiting: false,
+        wsSignalId: 0
+    };
+
+    // Register in appSpaces before moving the window
+    appSpaces.set(newWs, appData);
+
     try {
-        if (!win || win.unmanaged) return false;
+        Main.setWorkspaceName(newWs.index(), appName);
+    } catch (e) {
+        logDebug(`Failed to set workspace name: ${e}`);
+    }
+
+    appData.wsSignalId = newWs.connect('window-added', (ws, addedWin) => {
+        onWindowAddedToAppSpace(ws, addedWin);
+    });
+
+    win.change_workspace(newWs);
+    newWs.activate(global.get_current_time());
+    win.activate(global.get_current_time());
+
+    let mon = getMonitorRect(win);
+    win.move_resize_frame(false, mon.x, mon.y, mon.width, mon.height);
+    win.make_fullscreen();
+
+    // Multi-pass verification to eliminate Terminal PResizeInc and Electron CSD gaps
+    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        verifyFullscreen(win);
+        return GLib.SOURCE_REMOVE;
+    });
+    scheduleTimeout(70, () => verifyFullscreen(win));
+    scheduleTimeout(160, () => verifyFullscreen(win));
+
+    logDebug(`Entered App Space for '${appName}' on workspace index ${newWs.index()}`);
+}
+
+function exitAppSpace(win) {
+    if (!win) return;
+
+    let targetWsEntry = null;
+    for (let [ws, data] of appSpaces.entries()) {
+        if (data.ownerWindow === win) {
+            targetWsEntry = [ws, data];
+            break;
+        }
+    }
+    if (!targetWsEntry) return;
+
+    let [appWs, data] = targetWsEntry;
+    if (data.isExiting) return;
+    data.isExiting = true;
+
+    if (data.wsSignalId && appWs) {
+        try { appWs.disconnect(data.wsSignalId); } catch (e) {}
+        data.wsSignalId = 0;
+    }
+
+    let targetWs = getNearestNormalWorkspace(data.returnWorkspace);
+
+    if (isWindowAlive(win)) {
+        if (win.is_fullscreen()) {
+            win.unmake_fullscreen();
+        }
+
+        win.change_workspace(targetWs);
+        targetWs.activate(global.get_current_time());
+        win.activate(global.get_current_time());
+
+        if (data.wasMaximized) {
+            win.maximize(Meta.MaximizeFlags.BOTH);
+        } else {
+            win.unmaximize(Meta.MaximizeFlags.BOTH);
+            let wa = getWorkAreaRect(win);
+            let r = data.savedFloatingRect || { width: 900, height: 600, x: wa.x + 50, y: wa.y + 50 };
+            let gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
+            let gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
+            let gw = Math.min(r.width, wa.width);
+            let gh = Math.min(r.height, wa.height);
+            win.move_resize_frame(false, gx, gy, gw, gh);
+            win._savedFloatingRect = { x: gx, y: gy, width: gw, height: gh };
+        }
+
         let actor = win.get_compositor_private();
-        if (!actor) return false;
-        return true;
-    } catch (e) {
-        return false;
+        if (actor) actor.queue_redraw();
+        win.activate(global.get_current_time());
     }
-}
 
-function onWindowAddedToDedicated(ws, addedWin, dedicatedWin) {
-    if (!addedWin || addedWin === dedicatedWin) return;
-    try {
-        if (addedWin.is_on_all_workspaces()) return;
-    } catch (e) {
-        return;
-    }
-    if (isChildOrDialogOf(addedWin, dedicatedWin)) return;
-
-    logDebug(`Disallowed window '${addedWin.get_title()}' added to dedicated workspace '${Main.getWorkspaceName(ws.index())}'. Ejecting...`);
+    appSpaces.delete(appWs);
 
     scheduleTimeout(30, () => {
-        if (!addedWin || !isWindowValid(addedWin)) return;
-        let currentWs = null;
-        try { currentWs = addedWin.get_workspace(); } catch (e) {}
-        if (!currentWs || currentWs !== ws) return;
+        try {
+            if (typeof Main._removeWorkspace === "function") {
+                Main._removeWorkspace(appWs);
+            } else {
+                Main.setWorkspaceName(appWs.index(), "");
+                global.workspace_manager.remove_workspace(appWs, global.get_current_time());
+            }
+        } catch (e) {
+            try { global.workspace_manager.remove_workspace(appWs, global.get_current_time()); } catch (err) {}
+        }
+    });
 
-        let origWs = dedicatedWin._macDedicated ? dedicatedWin._macDedicated.origWs : null;
-        let targetWs = getNonDedicatedWorkspace(origWs);
+    logDebug(`Exited App Space for '${data.appName}', returned to workspace ${targetWs.index()}`);
+}
 
-        addedWin.change_workspace(targetWs);
+function toggleDedicatedWorkspace() {
+    let activeWs = global.workspace_manager.get_active_workspace();
+    let ownerWin = activeWs ? getOwnerWindowForWorkspace(activeWs) : null;
+    let focusWin = global.display.focus_window;
 
-        let wsMgr = global.workspace_manager;
-        let activeWs = wsMgr.get_active_workspace();
-        if (activeWs === ws) {
+    if (ownerWin) {
+        exitAppSpace(ownerWin);
+        return;
+    }
+
+    if (focusWin && isOwnerInAppSpace(focusWin)) {
+        exitAppSpace(focusWin);
+        return;
+    }
+
+    if (focusWin && isWindowAlive(focusWin) && focusWin.window_type === Meta.WindowType.NORMAL) {
+        if (!trackedWindows.has(focusWin)) {
+            trackWindow(focusWin);
+        }
+        enterAppSpace(focusWin);
+    }
+}
+
+function handleNewWindowIsolation(win) {
+    if (!isWindowAlive(win) || win.window_type !== Meta.WindowType.NORMAL) return;
+
+    let activeWs = global.workspace_manager.get_active_workspace();
+    if (!activeWs || !appSpaces.has(activeWs)) return;
+
+    let data = appSpaces.get(activeWs);
+    let ownerWin = data.ownerWindow;
+
+    if (win === ownerWin || isChildOrDialogOf(win, ownerWin)) return;
+
+    logDebug(`Strict Isolation: unrelated window '${win.get_title()}' created in App Space. Routing to normal workspace.`);
+
+    let targetWs = getNearestNormalWorkspace(data.returnWorkspace || activeWs);
+    win.change_workspace(targetWs);
+    targetWs.activate(global.get_current_time());
+    scheduleTimeout(40, () => {
+        try {
+            if (isWindowAlive(win)) win.activate(global.get_current_time());
+        } catch (e) {}
+    });
+}
+
+function onWindowAddedToAppSpace(ws, win) {
+    if (!ws || !win || win.unmanaged) return;
+    if (!appSpaces.has(ws)) return;
+
+    let data = appSpaces.get(ws);
+    let ownerWin = data.ownerWindow;
+
+    if (win === ownerWin || isChildOrDialogOf(win, ownerWin)) return;
+
+    if (win.is_on_all_workspaces()) {
+        try { win.unstick(); } catch (e) {}
+    }
+
+    scheduleTimeout(20, () => {
+        if (!isWindowAlive(win)) return;
+        let curWs = null;
+        try { curWs = win.get_workspace(); } catch (e) {}
+        if (curWs !== ws) return;
+
+        let targetWs = getNearestNormalWorkspace(data.returnWorkspace || ws);
+        win.change_workspace(targetWs);
+
+        if (global.workspace_manager.get_active_workspace() === ws) {
             targetWs.activate(global.get_current_time());
-            scheduleTimeout(50, () => {
+            scheduleTimeout(40, () => {
                 try {
-                    if (isWindowValid(addedWin)) {
-                        addedWin.activate(global.get_current_time());
-                    }
+                    if (isWindowAlive(win)) win.activate(global.get_current_time());
                 } catch (e) {}
             });
         }
     });
 }
 
-function removeWorkspaceIfEmpty(ws, fallbackWs) {
-    if (!ws || ws === fallbackWs) return;
-    let wsMgr = global.workspace_manager;
-    if (wsMgr.get_n_workspaces() <= 1) {
-        try { Main.setWorkspaceName(ws.index(), ""); } catch (e) {}
-        return;
-    }
-
-    let remaining = ws.list_windows().filter(
-        w => !w.is_on_all_workspaces() && w.window_type === Meta.WindowType.NORMAL
-    );
-    if (remaining.length === 0) {
-        dedicatedWorkspaces.delete(ws);
-        try {
-            if (typeof Main._removeWorkspace === "function") {
-                Main._removeWorkspace(ws);
-            } else {
-                Main.setWorkspaceName(ws.index(), "");
-                wsMgr.remove_workspace(ws, global.get_current_time());
-            }
-        } catch (e) {
-            try { wsMgr.remove_workspace(ws, global.get_current_time()); } catch (err) {}
+function onWindowMinimized(win) {
+    if (!isWindowAlive(win)) return;
+    let ws = null;
+    try { ws = win.get_workspace(); } catch (e) {}
+    if (ws && appSpaces.has(ws)) {
+        let data = appSpaces.get(ws);
+        if (data && data.ownerWindow === win && win.minimized) {
+            logDebug(`Prevented minimizing owner window '${win.get_title()}' in App Space.`);
+            win.unminimize();
         }
-    }
-}
-
-function applyTargetPresentation(win) {
-    if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-    let targetRect = getMonitorRect(win);
-    let postSnapDelay = cfg.settleDelay > 0 ? 70 : 10;
-
-    win.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
-
-    scheduleTimeout(postSnapDelay, () => {
-        if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-        if (!win.is_fullscreen()) win.make_fullscreen();
-
-        let actor = win.get_compositor_private();
-        if (actor) actor.queue_redraw();
-        win.activate(global.get_current_time());
-
-        scheduleTimeout(180, () => {
-            if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
-                win._macBusy = false;
-                logDebug(`entered fullscreen frame=${JSON.stringify(win.get_frame_rect())}`);
-            }
-        });
-    });
-}
-
-function enterDedicatedWorkspace(win, wasMaximized) {
-    let wsMgr = global.workspace_manager;
-    let origWs = win.get_workspace();
-    if (!origWs) return;
-
-    let preDelay = cfg.settleDelay > 0 ? 100 : 15;
-
-    let normalRect = null;
-    if (win._macNormalRect && !isMatchingWorkAreaOrScreen(win._macNormalRect, win)) {
-        normalRect = copyRect(win._macNormalRect);
-    } else if (!wasMaximized) {
-        let fr = win.get_frame_rect();
-        if (fr && !isMatchingWorkAreaOrScreen(fr, win)) {
-            normalRect = copyRect(fr);
-            win._macNormalRect = copyRect(fr);
-        }
-    }
-
-    win._macBusy = true;
-    win._macDedicated = {
-        origWs: origWs,
-        wasMaximized: wasMaximized,
-        normalRect: normalRect,
-        isExiting: false,
-        timerId: 0
-    };
-
-    logDebug(`enter start wasMax=${wasMaximized} normalRect=${JSON.stringify(win._macDedicated.normalRect)}`);
-
-    if (win.get_maximized() !== 0) {
-        win.unmaximize(Meta.MaximizeFlags.BOTH);
-    }
-
-    let t = global.get_current_time();
-    let newWs = wsMgr.append_new_workspace(false, t);
-    win._macDedicated.dedWs = newWs;
-    dedicatedWorkspaces.set(newWs, win);
-
-    let wsName = getWorkspaceTitleForWindow(win);
-    win._macDedicated.appName = wsName;
-    win._macDedicated.wsName = wsName;
-    try {
-        Main.setWorkspaceName(newWs.index(), wsName);
-        logDebug(`enter: workspace ${newWs.index()} named '${wsName}'`);
-    } catch (e) {
-        logDebug(`Failed to set workspace name: ${e}`);
-    }
-
-    win._macDedicated.wsSignalId = newWs.connect("window-added", (ws, addedWin) => {
-        onWindowAddedToDedicated(ws, addedWin, win);
-    });
-
-    win._macDedicated.timerId = scheduleTimeout(preDelay, () => {
-        if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-        win.change_workspace(newWs);
-        newWs.activate(global.get_current_time());
-        win.activate(global.get_current_time());
-
-        win._macDedicated.timerId = scheduleTimeout(cfg.settleDelay, () => {
-            if (!isWindowAlive(win) || !win._macDedicated || win._macDedicated.isExiting) return;
-            applyTargetPresentation(win);
-        });
-    });
-}
-
-function exitDedicatedWorkspace(win) {
-    let data = win._macDedicated;
-    if (!data || data.isExiting) return;
-    data.isExiting = true;
-
-    if (data.timerId) {
-        try { GLib.source_remove(data.timerId); activeTimeouts.delete(data.timerId); } catch (e) {}
-        data.timerId = 0;
-    }
-
-    if (data.wsSignalId && data.dedWs) {
-        try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
-        data.wsSignalId = 0;
-    }
-
-    win._macBusy = true;
-    let preDelay = cfg.settleDelay > 0 ? 90 : 15;
-
-    logDebug(`exit start wasMax=${data.wasMaximized} normalRect=${JSON.stringify(data.normalRect)}`);
-
-    let wsMgr = global.workspace_manager;
-    let targetWs = data.origWs;
-    if (!targetWs || targetWs.index() < 0 || targetWs.index() >= wsMgr.get_n_workspaces()) {
-        targetWs = wsMgr.get_workspace_by_index(0);
-    }
-
-    win.change_workspace(targetWs);
-    targetWs.activate(global.get_current_time());
-    win.activate(global.get_current_time());
-
-    if (win.minimized) {
-        win.unminimize();
-    }
-    if (win.is_fullscreen()) {
-        win.unmake_fullscreen();
-    }
-
-    data.timerId = scheduleTimeout(preDelay, () => {
-        if (!isWindowAlive(win)) {
-            removeWorkspaceIfEmpty(data.dedWs, targetWs);
-            dedicatedWorkspaces.delete(data.dedWs);
-            return;
-        }
-
-        if (data.wasMaximized) {
-            if (win.get_maximized() !== Meta.MaximizeFlags.BOTH) {
-                win.maximize(Meta.MaximizeFlags.BOTH);
-            }
-        } else {
-            if (win.get_maximized() !== 0) {
-                win.unmaximize(Meta.MaximizeFlags.BOTH);
-            }
-
-            let wa = getWorkAreaRect(win);
-            let r = data.normalRect;
-            let gx, gy, gw, gh;
-
-            if (r && r.width >= 100 && r.height >= 100 && !isMatchingWorkAreaOrScreen(r, win)) {
-                gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
-                gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
-                gw = Math.min(r.width, wa.width);
-                gh = Math.min(r.height, wa.height);
-            } else {
-                gw = Math.min(Math.round(wa.width * 0.75), 1400);
-                gh = Math.min(Math.round(wa.height * 0.75), 900);
-                gx = wa.x + Math.round((wa.width - gw) / 2);
-                gy = wa.y + Math.round((wa.height - gh) / 2);
-            }
-
-            win.move_resize_frame(false, gx, gy, gw, gh);
-            win.move_frame(false, gx, gy);
-            win._macNormalRect = { x: gx, y: gy, width: gw, height: gh };
-        }
-
-        let actor = win.get_compositor_private();
-        if (actor) actor.queue_redraw();
-        win.activate(global.get_current_time());
-
-        removeWorkspaceIfEmpty(data.dedWs, targetWs);
-        dedicatedWorkspaces.delete(data.dedWs);
-
-        data.timerId = scheduleTimeout(140, () => {
-            if (isWindowAlive(win)) {
-                win._macBusy = false;
-                win._macDedicated = null;
-                updateSavedRects(win);
-                logDebug(`exit done frame=${JSON.stringify(win.get_frame_rect())} max=${win.get_maximized()}`);
-            }
-        });
-    });
-}
-
-function resyncDedicatedWindow(win) {
-    if (!isWindowAlive(win) || !win._macDedicated || win._macBusy || win._macDedicated.isExiting) return;
-    let preDelay = cfg.settleDelay > 0 ? 80 : 10;
-    win._macBusy = true;
-
-    logDebug(`resyncing win='${win.get_title()}'`);
-
-    if (win.is_fullscreen()) win.unmake_fullscreen();
-    if (win.get_maximized() !== 0) win.unmaximize(Meta.MaximizeFlags.BOTH);
-
-    scheduleTimeout(preDelay, () => {
-        if (isWindowAlive(win) && win._macDedicated && !win._macDedicated.isExiting) {
-            applyTargetPresentation(win);
-        }
-    });
-}
-
-function onWorkspaceSwitched() {
-    if (!cfg.resyncOnSwitch) return;
-    let switchDelay = cfg.settleDelay > 0 ? 160 : 20;
-    scheduleTimeout(switchDelay, () => {
-        let activeWs = global.workspace_manager.get_active_workspace();
-        if (!activeWs || !dedicatedWorkspaces.has(activeWs)) return;
-        let dedWin = dedicatedWorkspaces.get(activeWs);
-        if (dedWin && isWindowAlive(dedWin) && dedWin._macDedicated && !dedWin._macBusy && !dedWin._macDedicated.isExiting) {
-            if (dedWin._macDedicated.dedWs === activeWs && dedWin.get_workspace() === activeWs) {
-                resyncDedicatedWindow(dedWin);
-            }
-        }
-    });
-}
-
-function onWindowMaximizeChanged(win) {
-    if (win._macBusy || win._macDedicated) return;
-    scheduleTimeout(70, () => updateSavedRects(win));
-}
-
-function onWindowMinimizedChanged(win) {
-    if (win._macBusy) return;
-    if (win._macDedicated && win.minimized) {
-        exitDedicatedWorkspace(win);
     }
 }
 
 function onWindowFullscreenChanged(win) {
-    if (win._macBusy) return;
-    if (win._macDedicated && !win.is_fullscreen()) {
-        exitDedicatedWorkspace(win);
+    if (!isWindowAlive(win)) return;
+    let ws = null;
+    try { ws = win.get_workspace(); } catch (e) {}
+    if (ws && appSpaces.has(ws)) {
+        let data = appSpaces.get(ws);
+        if (data && data.ownerWindow === win && !data.isExiting && !win.is_fullscreen()) {
+            logDebug(`Owner window '${win.get_title()}' un-fullscreened externally (F11). Exiting App Space.`);
+            exitAppSpace(win);
+        }
     }
 }
 
 function onWindowUnmanaged(win) {
-    let data = win._macDedicated;
-    win._macDedicated = null;
-    if (data) {
-        if (data.wsSignalId && data.dedWs) {
-            try { data.dedWs.disconnect(data.wsSignalId); } catch (e) {}
-            data.wsSignalId = 0;
-        }
-        if (data.dedWs) dedicatedWorkspaces.delete(data.dedWs);
-        scheduleTimeout(120, () => {
-            let wsMgr = global.workspace_manager;
-            let targetWs = data.origWs;
-            if (!targetWs || targetWs.index() < 0 || targetWs.index() >= wsMgr.get_n_workspaces()) {
-                targetWs = wsMgr.get_workspace_by_index(0);
-            }
+    for (let [ws, data] of Array.from(appSpaces.entries())) {
+        if (data.ownerWindow === win) {
+            logDebug(`Owner window '${data.appName}' closed. Cleaning up App Space.`);
+            appSpaces.delete(ws);
+            let targetWs = getNearestNormalWorkspace(data.returnWorkspace);
             if (targetWs) targetWs.activate(global.get_current_time());
-            removeWorkspaceIfEmpty(data.dedWs, targetWs);
-        });
+            scheduleTimeout(40, () => {
+                try {
+                    Main._removeWorkspace(ws);
+                } catch (e) {
+                    try { global.workspace_manager.remove_workspace(ws, global.get_current_time()); } catch (err) {}
+                }
+            });
+            break;
+        }
     }
     untrackWindow(win);
-}
-
-function onWindowTitleChanged(win) {
-    if (!win || !win._macDedicated || win._macDedicated.isExiting) return;
-    let dedWs = win._macDedicated.dedWs;
-    if (!dedWs) return;
-
-    let newName = getWorkspaceTitleForWindow(win);
-    if (newName && newName !== win._macDedicated.wsName) {
-        win._macDedicated.wsName = newName;
-        win._macDedicated.appName = newName;
-        try {
-            Main.setWorkspaceName(dedWs.index(), newName);
-            logDebug(`workspace ${dedWs.index()} title updated to '${newName}'`);
-        } catch (e) {}
-    }
 }
 
 function trackWindow(win) {
     if (!win || win.window_type !== Meta.WindowType.NORMAL || trackedWindows.has(win)) {
         return;
     }
-    
+
     let ids = [
-        win.connect("notify::maximized-horizontally", () => onWindowMaximizeChanged(win)),
-        win.connect("notify::minimized", () => onWindowMinimizedChanged(win)),
+        win.connect("notify::minimized", () => onWindowMinimized(win)),
         win.connect("notify::fullscreen", () => onWindowFullscreenChanged(win)),
-        win.connect("notify::title", () => onWindowTitleChanged(win)),
-        win.connect("position-changed", () => scheduleRectUpdate(win)),
-        win.connect("size-changed", () => scheduleRectUpdate(win)),
+        win.connect("position-changed", () => updateSavedFloatingRect(win)),
+        win.connect("size-changed", () => updateSavedFloatingRect(win)),
         win.connect("unmanaged", () => onWindowUnmanaged(win))
     ];
     trackedWindows.set(win, ids);
 
-    updateSavedRects(win);
+    updateSavedFloatingRect(win);
 
-    let currentWs = win.get_workspace();
-    if (currentWs) {
-        let dedWin = getDedicatedWindowForWorkspace(currentWs);
-        if (dedWin && dedWin !== win && !isChildOrDialogOf(win, dedWin)) {
-            onWindowAddedToDedicated(currentWs, win, dedWin);
-        }
+    let curWs = null;
+    try { curWs = win.get_workspace(); } catch (e) {}
+    if (curWs && appSpaces.has(curWs)) {
+        onWindowAddedToAppSpace(curWs, win);
     }
 }
 
 function untrackWindow(win) {
-    if (win && win._macRectTimer) {
-        try {
-            GLib.source_remove(win._macRectTimer);
-            activeTimeouts.delete(win._macRectTimer);
-        } catch (e) {}
-        win._macRectTimer = 0;
-    }
     let ids = trackedWindows.get(win);
     if (!ids) return;
     for (let id of ids) {
@@ -766,35 +568,349 @@ function untrackWindow(win) {
     trackedWindows.delete(win);
 }
 
-function toggleDedicatedWorkspace() {
+// ==========================================
+// EDGE-HOVER PANEL REVEAL (Auto-Show / Hide)
+// ==========================================
+
+function tearDownEdgeTriggers() {
+    for (let item of edgeTriggers) {
+        if (item.dwellTimer) {
+            try { GLib.source_remove(item.dwellTimer); } catch (e) {}
+        }
+        if (item.hideTimer) {
+            try { GLib.source_remove(item.hideTimer); } catch (e) {}
+        }
+        for (let sigId of item.signals) {
+            try { item.trigger.disconnect(sigId); } catch (e) {}
+        }
+        try { Main.layoutManager.removeChrome(item.trigger); } catch (e) {}
+        try { item.trigger.destroy(); } catch (e) {}
+    }
+    edgeTriggers = [];
+
+    for (let [panel, backup] of panelStateBackups.entries()) {
+        try {
+            if (panel && !panel._destroyed && panel.actor) {
+                panel._appSpaceRevealed = false;
+                Main.layoutManager._chrome.modifyActorParams(panel.actor, {
+                    visibleInFullscreen: backup.visibleInFullscreen,
+                    affectsStruts: backup.affectsStruts
+                });
+                panel._processPanelAutoHide();
+                Main.layoutManager._chrome._updateVisibility();
+            }
+        } catch (e) {}
+    }
+    panelStateBackups.clear();
+}
+
+function setupEdgeTriggers() {
+    tearDownEdgeTriggers();
+
+    if (!Main.panelManager || !Main.panelManager.panels) return;
+
+    for (let panel of Main.panelManager.panels) {
+        if (!panel || panel._destroyed || !panel.actor) continue;
+
+        let monIdx = panel.monitorIndex;
+        let mon = global.display.get_monitor_geometry(monIdx);
+        if (!mon || mon.width <= 0 || mon.height <= 0) continue;
+
+        if (!panelStateBackups.has(panel)) {
+            panelStateBackups.set(panel, {
+                visibleInFullscreen: false,
+                affectsStruts: panel._autohideSettings === "false"
+            });
+        }
+
+        let edgeThickness = 3;
+        let tx = mon.x, ty = mon.y, tw = mon.width, th = mon.height;
+        let pos = panel.panelPosition;
+
+        if (pos === Panel.PanelLoc.top) {
+            tx = mon.x; ty = mon.y; tw = mon.width; th = edgeThickness;
+        } else if (pos === Panel.PanelLoc.bottom) {
+            tx = mon.x; ty = mon.y + mon.height - edgeThickness; tw = mon.width; th = edgeThickness;
+        } else if (pos === Panel.PanelLoc.left) {
+            tx = mon.x; ty = mon.y; tw = edgeThickness; th = mon.height;
+        } else if (pos === Panel.PanelLoc.right) {
+            tx = mon.x + mon.width - edgeThickness; ty = mon.y; tw = edgeThickness; th = mon.height;
+        }
+
+        let trigger = new St.Widget({
+            reactive: true,
+            track_hover: true,
+            important: true,
+            style: "background-color: transparent;"
+        });
+        trigger.set_position(tx, ty);
+        trigger.set_size(tw, th);
+
+        Main.layoutManager.addChrome(trigger, {
+            visibleInFullscreen: true,
+            affectsInputRegion: true,
+            affectsStruts: false
+        });
+
+        let triggerData = {
+            trigger: trigger,
+            panel: panel,
+            dwellTimer: 0,
+            hideTimer: 0,
+            signals: []
+        };
+
+        triggerData.signals.push(trigger.connect('enter-event', () => onTriggerEnter(triggerData)));
+        triggerData.signals.push(trigger.connect('leave-event', () => onTriggerLeave(triggerData)));
+
+        edgeTriggers.push(triggerData);
+    }
+}
+
+function onTriggerEnter(data) {
     let activeWs = global.workspace_manager.get_active_workspace();
-    let dedWin = activeWs ? getDedicatedWindowForWorkspace(activeWs) : null;
-    let focusWin = global.display.focus_window;
+    if (!activeWs || !appSpaces.has(activeWs)) return;
 
-    if (dedWin) {
-        if (!dedWin._macBusy) {
-            exitDedicatedWorkspace(dedWin);
-        }
-        return;
+    if (data.hideTimer) {
+        try { GLib.source_remove(data.hideTimer); } catch (e) {}
+        data.hideTimer = 0;
     }
 
-    if (focusWin && focusWin._macDedicated) {
-        if (!focusWin._macBusy) {
-            exitDedicatedWorkspace(focusWin);
-        }
-        return;
+    if (data.panel._appSpaceRevealed) return;
+
+    if (data.dwellTimer) {
+        try { GLib.source_remove(data.dwellTimer); } catch (e) {}
     }
 
-    if (focusWin && !focusWin.unmanaged && focusWin.window_type === Meta.WindowType.NORMAL) {
-        if (!trackedWindows.has(focusWin)) {
-            trackWindow(focusWin);
+    data.dwellTimer = scheduleTimeout(250, () => {
+        data.dwellTimer = 0;
+        revealAppSpacePanel(data);
+    });
+}
+
+function onTriggerLeave(data) {
+    if (data.dwellTimer) {
+        try { GLib.source_remove(data.dwellTimer); } catch (e) {}
+        data.dwellTimer = 0;
+    }
+}
+
+function revealAppSpacePanel(data) {
+    let panel = data.panel;
+    if (!panel || panel._destroyed || !panel.actor) return;
+
+    let activeWs = global.workspace_manager.get_active_workspace();
+    if (!activeWs || !appSpaces.has(activeWs)) return;
+
+    panel._appSpaceRevealed = true;
+
+    Main.layoutManager._chrome.modifyActorParams(panel.actor, {
+        visibleInFullscreen: true,
+        affectsStruts: false
+    });
+    Main.layoutManager._chrome._updateVisibility();
+    Main.uiGroup.set_child_above_sibling(panel.actor, null);
+
+    if (typeof panel._showPanel === "function") {
+        panel._showPanel();
+    }
+
+    startPanelLeaveWatcher(data);
+}
+
+function startPanelLeaveWatcher(data) {
+    let panel = data.panel;
+    if (!panel || !panel.actor) return;
+
+    let checkInterval = 200;
+    scheduleTimeout(checkInterval, function check() {
+        if (!panel._appSpaceRevealed) return;
+
+        let activeWs = global.workspace_manager.get_active_workspace();
+        if (!activeWs || !appSpaces.has(activeWs)) {
+            hideAppSpacePanel(data, true);
+            return;
         }
-        if (!focusWin._macBusy) {
-            let wasMaximized = (focusWin.get_maximized() === Meta.MaximizeFlags.BOTH);
-            enterDedicatedWorkspace(focusWin, wasMaximized);
+
+        let mouseOnPanel = false;
+        try { mouseOnPanel = panel._mouseOnPanel(); } catch (e) {}
+
+        let hasMenus = false;
+        try {
+            if (typeof panel._panelHasOpenMenus === "function") {
+                hasMenus = panel._panelHasOpenMenus();
+            }
+        } catch (e) {}
+        if (!hasMenus && global.menuStack && global.menuStack.length > 0) {
+            hasMenus = global.menuStack.some(m => m && m.isOpen);
+        }
+
+        if (!mouseOnPanel && !hasMenus) {
+            if (!data.hideTimer) {
+                data.hideTimer = scheduleTimeout(350, () => {
+                    data.hideTimer = 0;
+                    hideAppSpacePanel(data, false);
+                });
+            }
+        } else {
+            if (data.hideTimer) {
+                try { GLib.source_remove(data.hideTimer); } catch (e) {}
+                data.hideTimer = 0;
+            }
+        }
+
+        scheduleTimeout(checkInterval, check);
+    });
+}
+
+function hideAppSpacePanel(data, immediate) {
+    let panel = data.panel;
+    if (!panel || panel._destroyed || !panel.actor) return;
+    if (!panel._appSpaceRevealed) return;
+
+    panel._appSpaceRevealed = false;
+
+    if (data.hideTimer) {
+        try { GLib.source_remove(data.hideTimer); } catch (e) {}
+        data.hideTimer = 0;
+    }
+
+    if (typeof panel._hidePanel === "function") {
+        panel._hidePanel();
+    }
+
+    let delay = immediate ? 0 : 270;
+    scheduleTimeout(delay, () => {
+        try {
+            if (!panel._appSpaceRevealed) {
+                Main.layoutManager._chrome.modifyActorParams(panel.actor, {
+                    visibleInFullscreen: false,
+                    affectsStruts: false
+                });
+                Main.layoutManager._chrome._updateVisibility();
+            }
+        } catch (e) {}
+    });
+}
+
+function onWorkspaceSwitched() {
+    let activeWs = global.workspace_manager.get_active_workspace();
+    let isApp = activeWs && appSpaces.has(activeWs);
+
+    if (!isApp) {
+        for (let data of edgeTriggers) {
+            if (data.panel && data.panel._appSpaceRevealed) {
+                hideAppSpacePanel(data, true);
+            }
+            let backup = panelStateBackups.get(data.panel);
+            if (backup && data.panel && data.panel.actor) {
+                Main.layoutManager._chrome.modifyActorParams(data.panel.actor, {
+                    visibleInFullscreen: backup.visibleInFullscreen,
+                    affectsStruts: backup.affectsStruts
+                });
+                data.panel._processPanelAutoHide();
+            }
+        }
+        Main.layoutManager._chrome._updateVisibility();
+    } else {
+        let data = appSpaces.get(activeWs);
+        if (data && data.ownerWindow && cfg.resyncOnSwitch) {
+            scheduleTimeout(cfg.settleDelay, () => {
+                verifyFullscreen(data.ownerWindow);
+            });
         }
     }
 }
+
+// ==========================================
+// EXPO & WORKSPACE REORDERING DND
+// ==========================================
+
+function clearAllDropTargets() {
+    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
+        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+            if (th.frame) {
+                th.frame.remove_style_class_name('expo-workspace-drop-target');
+            }
+        }
+    }
+}
+
+function syncExpoThumbnails() {
+    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
+        let box = Main.expo._thumbnailsBox;
+        box.thumbnails.sort((a, b) => a.metaWorkspace.index() - b.metaWorkspace.index());
+        box.thumbnails.forEach(th => th.refreshTitle());
+        box.actor.queue_relayout();
+    }
+}
+
+function reorderWorkspace(ws, targetIndex) {
+    if (!ws) return;
+    let wsMgr = global.workspace_manager;
+    let fromIndex = ws.index();
+    if (fromIndex === targetIndex || targetIndex < 0 || targetIndex >= wsMgr.n_workspaces) return;
+
+    let names = Main.workspace_names.slice();
+    while (names.length < wsMgr.n_workspaces) {
+        names.push("");
+    }
+    let [movedName] = names.splice(fromIndex, 1);
+    names.splice(targetIndex, 0, movedName || "");
+    Main.workspace_names = names;
+    Main._trimWorkspaceNames();
+    Main.wmSettings.set_strv("workspace-names", Main.workspace_names);
+
+    wsMgr.reorder_workspace(ws, targetIndex);
+    syncExpoThumbnails();
+}
+
+function setupThumbnailDND(thumbnail) {
+    if (thumbnail._customDndInitialized) return;
+    thumbnail._customDndInitialized = true;
+
+    thumbnail.isWorkspaceCard = true;
+
+    thumbnail.getDragActor = function() {
+        let ws = this.metaWorkspace;
+        let wsName = isAppSpace(ws) ?
+            appSpaces.get(ws).appName :
+            Main.getWorkspaceName(ws.index());
+
+        let box = new St.BoxLayout({
+            style_class: 'expo-workspace-drag-actor',
+            vertical: true
+        });
+        let label = new St.Label({
+            style_class: 'expo-workspace-drag-label',
+            text: wsName
+        });
+        box.add_actor(label);
+        return box;
+    };
+
+    thumbnail.getDragActorSource = function() {
+        return this.actor;
+    };
+
+    thumbnail._titleDraggable = DND.makeDraggable(thumbnail.title, {
+        restoreOnSuccess: false,
+        manualMode: false
+    });
+    thumbnail._titleDraggable.connect('drag-end', clearAllDropTargets);
+    thumbnail._titleDraggable.connect('drag-cancelled', clearAllDropTargets);
+
+    thumbnail._actorDraggable = DND.makeDraggable(thumbnail.actor, {
+        restoreOnSuccess: false,
+        manualMode: false
+    });
+    thumbnail._actorDraggable.connect('drag-end', clearAllDropTargets);
+    thumbnail._actorDraggable.connect('drag-cancelled', clearAllDropTargets);
+}
+
+// ==========================================
+// KEYBINDINGS & LIFECYCLE
+// ==========================================
 
 function registerHotkeys() {
     try { Main.keybindingManager.removeHotKey(UUID + "-exit"); } catch (e) {}
@@ -817,28 +933,169 @@ function init(metadata) {
 }
 
 function enable() {
+    // 1. Hook Expo prototype methods reversibly
+    origExpoThumbnailInit = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init = function(metaWorkspace, box) {
+        origExpoThumbnailInit.apply(this, arguments);
+        setupThumbnailDND(this);
+    };
+
+    origExpoRefreshTitle = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.refreshTitle;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.refreshTitle = function() {
+        origExpoRefreshTitle.apply(this, arguments);
+        if (isAppSpace(this.metaWorkspace)) {
+            let data = appSpaces.get(this.metaWorkspace);
+            if (data && data.appName) {
+                this.title.set_text(data.appName);
+            }
+            this.frame.add_style_class_name('app-space-card');
+            if (this.titleText) this.titleText.editable = false;
+            if (this.windows) {
+                for (let clone of this.windows) {
+                    if (clone._draggable) clone._draggable.inhibit = true;
+                }
+            }
+        } else {
+            this.frame.remove_style_class_name('app-space-card');
+            if (this.titleText) this.titleText.editable = true;
+            if (this.windows) {
+                for (let clone of this.windows) {
+                    if (clone._draggable) clone._draggable.inhibit = false;
+                }
+            }
+        }
+    };
+
+    origExpoOnTitleKeyPress = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.onTitleKeyPressEvent;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.onTitleKeyPressEvent = function(actor, event) {
+        if (isAppSpace(this.metaWorkspace)) return true;
+        return origExpoOnTitleKeyPress.apply(this, arguments);
+    };
+
+    origExpoHandleDragOverOrDrop = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop = function(dropping, source, actor, x, y, time) {
+        if (source && source.isWorkspaceCard) {
+            if (source === this || source.metaWorkspace === this.metaWorkspace) {
+                return DND.DragMotionResult.CONTINUE;
+            }
+            if (dropping) {
+                clearAllDropTargets();
+                let fromIndex = source.metaWorkspace.index();
+                let toIndex = this.metaWorkspace.index();
+                reorderWorkspace(source.metaWorkspace, toIndex);
+                return DND.DragMotionResult.MOVE_DROP;
+            } else {
+                this.frame.add_style_class_name('expo-workspace-drop-target');
+                return DND.DragMotionResult.MOVE_DROP;
+            }
+        }
+
+        if (source && source.metaWindow && isAppSpace(this.metaWorkspace)) {
+            let ownerWin = getOwnerWindowForWorkspace(this.metaWorkspace);
+            if (source.metaWindow !== ownerWin && !isChildOrDialogOf(source.metaWindow, ownerWin)) {
+                return DND.DragMotionResult.CONTINUE;
+            }
+        }
+
+        return origExpoHandleDragOverOrDrop.apply(this, arguments);
+    };
+
+    origExpoRemove = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.remove;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.remove = function() {
+        if (isAppSpace(this.metaWorkspace)) {
+            let ownerWin = getOwnerWindowForWorkspace(this.metaWorkspace);
+            if (ownerWin) {
+                exitAppSpace(ownerWin);
+                return;
+            }
+        }
+        return origExpoRemove.apply(this, arguments);
+    };
+
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut = function(source, actor) {
+        if (this.frame) {
+            this.frame.remove_style_class_name('expo-workspace-drop-target');
+        }
+    };
+
+    // 2. Hook Main workspace name functions
+    origGetWorkspaceName = Main.getWorkspaceName;
+    Main.getWorkspaceName = function(index) {
+        let ws = global.workspace_manager.get_workspace_by_index(index);
+        if (ws && appSpaces.has(ws)) {
+            return appSpaces.get(ws).appName;
+        }
+        return origGetWorkspaceName.call(Main, index);
+    };
+
+    origHasDefaultWorkspaceName = Main.hasDefaultWorkspaceName;
+    Main.hasDefaultWorkspaceName = function(index) {
+        let ws = global.workspace_manager.get_workspace_by_index(index);
+        if (ws && appSpaces.has(ws)) {
+            return false;
+        }
+        return origHasDefaultWorkspaceName.call(Main, index);
+    };
+
+    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
+        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+            setupThumbnailDND(th);
+            th.refreshTitle();
+        }
+    }
+
+    // 3. Track existing windows
     for (let actor of global.get_window_actors()) {
         let win = actor.get_meta_window();
         if (win) trackWindow(win);
     }
 
+    // 4. Connect global signals
     globalSignals.push({
         obj: global.display,
-        id: global.display.connect("window-created", (display, win) => {
-            scheduleTimeout(80, () => trackWindow(win));
+        id: global.display.connect('window-created', (display, win) => {
+            scheduleTimeout(50, () => {
+                if (win && !win.unmanaged) {
+                    trackWindow(win);
+                    handleNewWindowIsolation(win);
+                }
+            });
         })
     });
+
     globalSignals.push({
         obj: global.window_manager,
-        id: global.window_manager.connect("switch-workspace", () => onWorkspaceSwitched())
+        id: global.window_manager.connect('switch-workspace', () => {
+            onWorkspaceSwitched();
+        })
     });
 
+    globalSignals.push({
+        obj: global.workspace_manager,
+        id: global.workspace_manager.connect('workspaces-reordered', () => {
+            syncExpoThumbnails();
+        })
+    });
+
+    globalSignals.push({
+        obj: Main.layoutManager,
+        id: Main.layoutManager.connect('monitors-changed', () => {
+            setupEdgeTriggers();
+        })
+    });
+
+    // 5. Setup panel edge triggers
+    setupEdgeTriggers();
+
+    // 6. Register hotkey
     registerHotkeys();
-    logDebug("Extension enabled");
+
+    logDebug("Extension 2.0 enabled successfully");
 }
 
 function disable() {
     clearAllTimeouts();
+
     try { Main.keybindingManager.removeHotKey(UUID + "-exit"); } catch (e) {}
 
     for (let sig of globalSignals) {
@@ -846,18 +1103,50 @@ function disable() {
     }
     globalSignals = [];
 
-    for (let [ws, win] of dedicatedWorkspaces.entries()) {
-        if (win && win._macDedicated && win._macDedicated.wsSignalId) {
-            try { ws.disconnect(win._macDedicated.wsSignalId); } catch (e) {}
-            win._macDedicated.wsSignalId = 0;
+    tearDownEdgeTriggers();
+
+    // Restore patched prototypes
+    if (origExpoThumbnailInit) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init = origExpoThumbnailInit;
+    if (origExpoRefreshTitle) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.refreshTitle = origExpoRefreshTitle;
+    if (origExpoOnTitleKeyPress) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.onTitleKeyPressEvent = origExpoOnTitleKeyPress;
+    if (origExpoHandleDragOverOrDrop) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop = origExpoHandleDragOverOrDrop;
+    if (origExpoRemove) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.remove = origExpoRemove;
+    delete ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut;
+
+    if (origGetWorkspaceName) Main.getWorkspaceName = origGetWorkspaceName;
+    if (origHasDefaultWorkspaceName) Main.hasDefaultWorkspaceName = origHasDefaultWorkspaceName;
+
+    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
+        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+            delete th._customDndInitialized;
+            delete th.isWorkspaceCard;
+            if (th._titleDraggable) {
+                try { th._titleDraggable.disconnectAll(); } catch (e) {}
+                delete th._titleDraggable;
+            }
+            if (th._actorDraggable) {
+                try { th._actorDraggable.disconnectAll(); } catch (e) {}
+                delete th._actorDraggable;
+            }
+            th.refreshTitle();
         }
     }
 
-    for (let win of Array.from(trackedWindows.keys())) {
-        if (win._macDedicated) {
-            exitDedicatedWorkspace(win);
+    // Cleanly exit all active App Spaces
+    for (let [ws, data] of Array.from(appSpaces.entries())) {
+        if (data.ownerWindow && !data.ownerWindow.unmanaged) {
+            exitAppSpace(data.ownerWindow);
+        } else {
+            appSpaces.delete(ws);
+            try { Main._removeWorkspace(ws); } catch(e) { global.workspace_manager.remove_workspace(ws, global.get_current_time()); }
         }
+    }
+    appSpaces.clear();
+
+    for (let win of Array.from(trackedWindows.keys())) {
         untrackWindow(win);
     }
-    dedicatedWorkspaces.clear();
+    trackedWindows.clear();
+
+    logDebug("Extension disabled cleanly");
 }

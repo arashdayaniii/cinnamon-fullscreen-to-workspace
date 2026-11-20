@@ -1,0 +1,23 @@
+/* Cinnamon Fullscreen To Workspace - Dual-Workspace & Expo Styling */
+
+.app-space-card {
+    border: 2px solid #3584e4 !important;
+}
+
+.expo-workspace-drop-target {
+    border: 3px solid #3584e4 !important;
+    background-color: rgba(53, 132, 228, 0.28) !important;
+}
+
+.expo-workspace-drag-actor {
+    background-color: rgba(25, 25, 25, 0.92);
+    border: 2px solid #3584e4;
+    border-radius: 8px;
+    padding: 10px 18px;
+}
+
+.expo-workspace-drag-label {
+    font-weight: bold;
+    font-size: 13px;
+    color: #ffffff;
+}
