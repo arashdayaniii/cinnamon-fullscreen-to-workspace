@@ -22,7 +22,7 @@ let activeTimeouts = new Set();
 let globalSignals = [];
 
 // Dual-Workspace State: Map keyed by Meta.Workspace reference
-// Value: { ownerWindow, returnWorkspace, appName, wasMaximized, savedFloatingRect, isExiting, wsSignalId }
+// Value: { ownerWindow, returnWorkspace, appName, wasMaximized, savedMaximizedFlags, savedFloatingRect, isExiting, wsSignalId }
 const appSpaces = new Map();
 
 // Window Tracking: Map keyed by Meta.Window reference -> array of signal connection IDs
@@ -36,7 +36,9 @@ const panelStateBackups = new Map();
 let origExpoThumbnailInit = null;
 let origExpoRefreshTitle = null;
 let origExpoOnTitleKeyPress = null;
-let origExpoHandleDragOverOrDrop = null;
+let origExpoHandleDragOver = null;
+let origExpoHandleDragOut = null;
+let origExpoAcceptDrop = null;
 let origExpoRemove = null;
 let origGetWorkspaceName = null;
 let origHasDefaultWorkspaceName = null;
@@ -266,7 +268,8 @@ function enterAppSpace(win) {
     let origWs = win.get_workspace();
     if (!origWs) return;
 
-    let wasMaximized = (win.get_maximized() === Meta.MaximizeFlags.BOTH);
+    let wasMaximized = (win.get_maximized() !== 0);
+    let savedMaximizedFlags = win.get_maximized();
     let floatingRect = null;
 
     if (!wasMaximized) {
@@ -289,9 +292,8 @@ function enterAppSpace(win) {
         };
     }
 
-    if (win.get_maximized() !== 0) {
-        win.unmaximize(Meta.MaximizeFlags.BOTH);
-    }
+    // Do NOT unmaximize beforehand: Muffin and EWMH transition directly from maximized to fullscreen
+    // without triggering an intermediate floating resize and client size-negotiation race!
 
     let wsMgr = global.workspace_manager;
     let activeIdx = origWs.index();
@@ -305,6 +307,7 @@ function enterAppSpace(win) {
         returnWorkspace: origWs,
         appName: appName,
         wasMaximized: wasMaximized,
+        savedMaximizedFlags: savedMaximizedFlags,
         savedFloatingRect: floatingRect,
         isExiting: false,
         wsSignalId: 0
@@ -327,17 +330,22 @@ function enterAppSpace(win) {
     newWs.activate(global.get_current_time());
     win.activate(global.get_current_time());
 
-    let mon = getMonitorRect(win);
-    win.move_resize_frame(false, mon.x, mon.y, mon.width, mon.height);
-    win.make_fullscreen();
+    // Once on the new workspace, enforce fullscreen cleanly
+    scheduleTimeout(30, () => {
+        if (!isWindowAlive(win) || appData.isExiting) return;
+        win.make_fullscreen();
+        verifyFullscreen(win);
+    });
 
     // Multi-pass verification to eliminate Terminal PResizeInc and Electron CSD gaps
-    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+    scheduleTimeout(90, () => {
+        if (!isWindowAlive(win) || appData.isExiting) return;
         verifyFullscreen(win);
-        return GLib.SOURCE_REMOVE;
     });
-    scheduleTimeout(70, () => verifyFullscreen(win));
-    scheduleTimeout(160, () => verifyFullscreen(win));
+    scheduleTimeout(200, () => {
+        if (!isWindowAlive(win) || appData.isExiting) return;
+        verifyFullscreen(win);
+    });
 
     logDebug(`Entered App Space for '${appName}' on workspace index ${newWs.index()}`);
 }
@@ -366,36 +374,45 @@ function exitAppSpace(win) {
     let targetWs = getNearestNormalWorkspace(data.returnWorkspace);
 
     if (isWindowAlive(win)) {
-        if (win.is_fullscreen()) {
-            win.unmake_fullscreen();
-        }
-
+        // 1. Move to returnWorkspace and activate it FIRST so panels & workarea are active on targetWs
         win.change_workspace(targetWs);
         targetWs.activate(global.get_current_time());
         win.activate(global.get_current_time());
 
-        if (data.wasMaximized) {
-            win.maximize(Meta.MaximizeFlags.BOTH);
-        } else {
-            win.unmaximize(Meta.MaximizeFlags.BOTH);
-            let wa = getWorkAreaRect(win);
-            let r = data.savedFloatingRect || { width: 900, height: 600, x: wa.x + 50, y: wa.y + 50 };
-            let gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
-            let gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
-            let gw = Math.min(r.width, wa.width);
-            let gh = Math.min(r.height, wa.height);
-            win.move_resize_frame(false, gx, gy, gw, gh);
-            win._savedFloatingRect = { x: gx, y: gy, width: gw, height: gh };
+        // 2. Call unmake_fullscreen
+        if (win.is_fullscreen()) {
+            win.unmake_fullscreen();
         }
 
-        let actor = win.get_compositor_private();
-        if (actor) actor.queue_redraw();
-        win.activate(global.get_current_time());
+        // 3. Settle tick for Muffin to finish un-fullscreening and recalculate workarea
+        scheduleTimeout(50, () => {
+            if (!isWindowAlive(win)) return;
+
+            if (data.wasMaximized) {
+                // Restore maximized state directly without move_resize_frame
+                win.maximize(data.savedMaximizedFlags || Meta.MaximizeFlags.BOTH);
+            } else {
+                win.unmaximize(Meta.MaximizeFlags.BOTH);
+                let wa = getWorkAreaRect(win);
+                let r = data.savedFloatingRect || { width: 900, height: 600, x: wa.x + 50, y: wa.y + 50 };
+                let gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
+                let gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
+                let gw = Math.min(r.width, wa.width);
+                let gh = Math.min(r.height, wa.height);
+                win.move_resize_frame(false, gx, gy, gw, gh);
+                win._savedFloatingRect = { x: gx, y: gy, width: gw, height: gh };
+            }
+
+            let actor = win.get_compositor_private();
+            if (actor) actor.queue_redraw();
+            win.activate(global.get_current_time());
+        });
     }
 
     appSpaces.delete(appWs);
 
-    scheduleTimeout(30, () => {
+    // Remove the App Space workspace after the window has returned and settled
+    scheduleTimeout(100, () => {
         try {
             if (typeof Main._removeWorkspace === "function") {
                 Main._removeWorkspace(appWs);
@@ -577,9 +594,6 @@ function tearDownEdgeTriggers() {
         if (item.dwellTimer) {
             try { GLib.source_remove(item.dwellTimer); } catch (e) {}
         }
-        if (item.hideTimer) {
-            try { GLib.source_remove(item.hideTimer); } catch (e) {}
-        }
         for (let sigId of item.signals) {
             try { item.trigger.disconnect(sigId); } catch (e) {}
         }
@@ -656,7 +670,6 @@ function setupEdgeTriggers() {
             trigger: trigger,
             panel: panel,
             dwellTimer: 0,
-            hideTimer: 0,
             signals: []
         };
 
@@ -671,18 +684,13 @@ function onTriggerEnter(data) {
     let activeWs = global.workspace_manager.get_active_workspace();
     if (!activeWs || !appSpaces.has(activeWs)) return;
 
-    if (data.hideTimer) {
-        try { GLib.source_remove(data.hideTimer); } catch (e) {}
-        data.hideTimer = 0;
-    }
-
     if (data.panel._appSpaceRevealed) return;
 
     if (data.dwellTimer) {
         try { GLib.source_remove(data.dwellTimer); } catch (e) {}
     }
 
-    data.dwellTimer = scheduleTimeout(250, () => {
+    data.dwellTimer = scheduleTimeout(220, () => {
         data.dwellTimer = 0;
         revealAppSpacePanel(data);
     });
@@ -722,8 +730,7 @@ function startPanelLeaveWatcher(data) {
     let panel = data.panel;
     if (!panel || !panel.actor) return;
 
-    let checkInterval = 200;
-    scheduleTimeout(checkInterval, function check() {
+    function checkAndHide() {
         if (!panel._appSpaceRevealed) return;
 
         let activeWs = global.workspace_manager.get_active_workspace();
@@ -734,6 +741,7 @@ function startPanelLeaveWatcher(data) {
 
         let mouseOnPanel = false;
         try { mouseOnPanel = panel._mouseOnPanel(); } catch (e) {}
+        if (mouseOnPanel) return;
 
         let hasMenus = false;
         try {
@@ -744,22 +752,30 @@ function startPanelLeaveWatcher(data) {
         if (!hasMenus && global.menuStack && global.menuStack.length > 0) {
             hasMenus = global.menuStack.some(m => m && m.isOpen);
         }
+        if (hasMenus) return;
 
-        if (!mouseOnPanel && !hasMenus) {
-            if (!data.hideTimer) {
-                data.hideTimer = scheduleTimeout(350, () => {
-                    data.hideTimer = 0;
-                    hideAppSpacePanel(data, false);
-                });
-            }
-        } else {
-            if (data.hideTimer) {
-                try { GLib.source_remove(data.hideTimer); } catch (e) {}
-                data.hideTimer = 0;
-            }
+        // Mouse left panel and no menus open: hide immediately (snappy response)
+        hideAppSpacePanel(data, false);
+    }
+
+    // Connect leave-event on panel actor for immediate trigger with 40ms debounce
+    let leaveId = panel.actor.connect('leave-event', () => {
+        scheduleTimeout(40, checkAndHide);
+    });
+
+    // Check with fast 40ms polling interval while revealed to catch menu closes
+    let pollInterval = 40;
+    scheduleTimeout(pollInterval, function poll() {
+        if (!panel._appSpaceRevealed) {
+            try { panel.actor.disconnect(leaveId); } catch (e) {}
+            return;
         }
-
-        scheduleTimeout(checkInterval, check);
+        checkAndHide();
+        if (panel._appSpaceRevealed) {
+            scheduleTimeout(pollInterval, poll);
+        } else {
+            try { panel.actor.disconnect(leaveId); } catch (e) {}
+        }
     });
 }
 
@@ -770,16 +786,11 @@ function hideAppSpacePanel(data, immediate) {
 
     panel._appSpaceRevealed = false;
 
-    if (data.hideTimer) {
-        try { GLib.source_remove(data.hideTimer); } catch (e) {}
-        data.hideTimer = 0;
-    }
-
     if (typeof panel._hidePanel === "function") {
         panel._hidePanel();
     }
 
-    let delay = immediate ? 0 : 270;
+    let delay = immediate ? 0 : 260;
     scheduleTimeout(delay, () => {
         try {
             if (!panel._appSpaceRevealed) {
@@ -840,6 +851,7 @@ function syncExpoThumbnails() {
     if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
         let box = Main.expo._thumbnailsBox;
         box.thumbnails.sort((a, b) => a.metaWorkspace.index() - b.metaWorkspace.index());
+        box.kbThumbnailIndex = global.workspace_manager.get_active_workspace_index();
         box.thumbnails.forEach(th => th.refreshTitle());
         box.actor.queue_relayout();
     }
@@ -866,10 +878,13 @@ function reorderWorkspace(ws, targetIndex) {
 }
 
 function setupThumbnailDND(thumbnail) {
-    if (thumbnail._customDndInitialized) return;
+    if (!thumbnail || thumbnail._customDndInitialized) return;
     thumbnail._customDndInitialized = true;
 
     thumbnail.isWorkspaceCard = true;
+    thumbnail.actor._delegate = thumbnail;
+    thumbnail.frame._delegate = thumbnail;
+    thumbnail.title._delegate = thumbnail;
 
     thumbnail.getDragActor = function() {
         let ws = this.metaWorkspace;
@@ -893,19 +908,19 @@ function setupThumbnailDND(thumbnail) {
         return this.actor;
     };
 
-    thumbnail._titleDraggable = DND.makeDraggable(thumbnail.title, {
-        restoreOnSuccess: false,
-        manualMode: false
-    });
-    thumbnail._titleDraggable.connect('drag-end', clearAllDropTargets);
-    thumbnail._titleDraggable.connect('drag-cancelled', clearAllDropTargets);
-
     thumbnail._actorDraggable = DND.makeDraggable(thumbnail.actor, {
         restoreOnSuccess: false,
         manualMode: false
     });
     thumbnail._actorDraggable.connect('drag-end', clearAllDropTargets);
     thumbnail._actorDraggable.connect('drag-cancelled', clearAllDropTargets);
+
+    thumbnail._titleDraggable = DND.makeDraggable(thumbnail.title, {
+        restoreOnSuccess: false,
+        manualMode: false
+    });
+    thumbnail._titleDraggable.connect('drag-end', clearAllDropTargets);
+    thumbnail._titleDraggable.connect('drag-cancelled', clearAllDropTargets);
 }
 
 // ==========================================
@@ -933,10 +948,25 @@ function init(metadata) {
 }
 
 function enable() {
-    // 1. Hook Expo prototype methods reversibly
+    // 1. Hook Expo Workspace Thumbnail prototype methods
     origExpoThumbnailInit = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init;
     ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init = function(metaWorkspace, box) {
+        // Intercept button-press-event so the stock click handler does not swallow events with return true,
+        // allowing DND.makeDraggable to receive the event and initiate dragging!
+        let origActorConnect = this.actor.connect;
+        this.actor.connect = function(signal, callback) {
+            if (signal === 'button-press-event') {
+                return origActorConnect.call(this, signal, (actor, event) => {
+                    callback(actor, event);
+                    return false; // Crucial: allow DND.makeDraggable to process button-press
+                });
+            }
+            return origActorConnect.apply(this, arguments);
+        };
+
         origExpoThumbnailInit.apply(this, arguments);
+
+        this.actor.connect = origActorConnect;
         setupThumbnailDND(this);
     };
 
@@ -950,6 +980,7 @@ function enable() {
             }
             this.frame.add_style_class_name('app-space-card');
             if (this.titleText) this.titleText.editable = false;
+            // On App Space: inhibit window clone DND so dragging anywhere on the card drags the workspace card!
             if (this.windows) {
                 for (let clone of this.windows) {
                     if (clone._draggable) clone._draggable.inhibit = true;
@@ -958,6 +989,7 @@ function enable() {
         } else {
             this.frame.remove_style_class_name('app-space-card');
             if (this.titleText) this.titleText.editable = true;
+            // On Normal workspace: window clone DND is active for moving windows between workspaces!
             if (this.windows) {
                 for (let clone of this.windows) {
                     if (clone._draggable) clone._draggable.inhibit = false;
@@ -972,24 +1004,19 @@ function enable() {
         return origExpoOnTitleKeyPress.apply(this, arguments);
     };
 
-    origExpoHandleDragOverOrDrop = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop;
-    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop = function(dropping, source, actor, x, y, time) {
+    origExpoHandleDragOver = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOver;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOver = function(source, actor, x, y, time) {
         if (source && source.isWorkspaceCard) {
             if (source === this || source.metaWorkspace === this.metaWorkspace) {
                 return DND.DragMotionResult.CONTINUE;
             }
-            if (dropping) {
-                clearAllDropTargets();
-                let fromIndex = source.metaWorkspace.index();
-                let toIndex = this.metaWorkspace.index();
-                reorderWorkspace(source.metaWorkspace, toIndex);
-                return DND.DragMotionResult.MOVE_DROP;
-            } else {
+            if (this.frame) {
                 this.frame.add_style_class_name('expo-workspace-drop-target');
-                return DND.DragMotionResult.MOVE_DROP;
             }
+            return DND.DragMotionResult.MOVE_DROP;
         }
 
+        // Block dropping unrelated windows onto an App Space
         if (source && source.metaWindow && isAppSpace(this.metaWorkspace)) {
             let ownerWin = getOwnerWindowForWorkspace(this.metaWorkspace);
             if (source.metaWindow !== ownerWin && !isChildOrDialogOf(source.metaWindow, ownerWin)) {
@@ -997,7 +1024,34 @@ function enable() {
             }
         }
 
-        return origExpoHandleDragOverOrDrop.apply(this, arguments);
+        return origExpoHandleDragOver.apply(this, arguments);
+    };
+
+    origExpoHandleDragOut = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut = function(source, actor) {
+        if (this.frame) {
+            this.frame.remove_style_class_name('expo-workspace-drop-target');
+        }
+        if (origExpoHandleDragOut) {
+            origExpoHandleDragOut.apply(this, arguments);
+        }
+    };
+
+    origExpoAcceptDrop = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.acceptDrop;
+    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.acceptDrop = function(source, actor, x, y, time) {
+        if (source && source.isWorkspaceCard) {
+            clearAllDropTargets();
+            if (source === this || source.metaWorkspace === this.metaWorkspace) {
+                return false;
+            }
+            let fromIndex = source.metaWorkspace.index();
+            let toIndex = this.metaWorkspace.index();
+            logDebug(`Expo DND Drop: reordering workspace ${fromIndex} -> ${toIndex}`);
+            reorderWorkspace(source.metaWorkspace, toIndex);
+            return true;
+        }
+
+        return origExpoAcceptDrop.apply(this, arguments);
     };
 
     origExpoRemove = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.remove;
@@ -1010,12 +1064,6 @@ function enable() {
             }
         }
         return origExpoRemove.apply(this, arguments);
-    };
-
-    ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut = function(source, actor) {
-        if (this.frame) {
-            this.frame.remove_style_class_name('expo-workspace-drop-target');
-        }
     };
 
     // 2. Hook Main workspace name functions
@@ -1037,6 +1085,7 @@ function enable() {
         return origHasDefaultWorkspaceName.call(Main, index);
     };
 
+    // Setup existing thumbnails if Expo is currently open
     if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
         for (let th of Main.expo._thumbnailsBox.thumbnails) {
             setupThumbnailDND(th);
@@ -1090,7 +1139,7 @@ function enable() {
     // 6. Register hotkey
     registerHotkeys();
 
-    logDebug("Extension 2.0 enabled successfully");
+    logDebug("Extension 2.0.1 enabled successfully");
 }
 
 function disable() {
@@ -1109,9 +1158,10 @@ function disable() {
     if (origExpoThumbnailInit) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init = origExpoThumbnailInit;
     if (origExpoRefreshTitle) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.refreshTitle = origExpoRefreshTitle;
     if (origExpoOnTitleKeyPress) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.onTitleKeyPressEvent = origExpoOnTitleKeyPress;
-    if (origExpoHandleDragOverOrDrop) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOverOrDrop = origExpoHandleDragOverOrDrop;
+    if (origExpoHandleDragOver) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOver = origExpoHandleDragOver;
+    if (origExpoHandleDragOut) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut = origExpoHandleDragOut;
+    if (origExpoAcceptDrop) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.acceptDrop = origExpoAcceptDrop;
     if (origExpoRemove) ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.remove = origExpoRemove;
-    delete ExpoThumbnail.ExpoWorkspaceThumbnail.prototype.handleDragOut;
 
     if (origGetWorkspaceName) Main.getWorkspaceName = origGetWorkspaceName;
     if (origHasDefaultWorkspaceName) Main.hasDefaultWorkspaceName = origHasDefaultWorkspaceName;
