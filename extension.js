@@ -837,9 +837,15 @@ function onWorkspaceSwitched() {
 // EXPO & WORKSPACE REORDERING DND
 // ==========================================
 
+function getExpoThumbnailsBox() {
+    if (!Main.expo) return null;
+    return Main.expo._expo || Main.expo._thumbnailsBox || null;
+}
+
 function clearAllDropTargets() {
-    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
-        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+    let box = getExpoThumbnailsBox();
+    if (box && box.thumbnails) {
+        for (let th of box.thumbnails) {
             if (th && th.frame) {
                 th.frame.remove_style_class_name('expo-workspace-drop-target');
             }
@@ -848,13 +854,74 @@ function clearAllDropTargets() {
 }
 
 function syncExpoThumbnails() {
-    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
-        let box = Main.expo._thumbnailsBox;
-        box.thumbnails.sort((a, b) => a.metaWorkspace.index() - b.metaWorkspace.index());
-        box.kbThumbnailIndex = global.workspace_manager.get_active_workspace_index();
-        box.thumbnails.forEach(th => th.refreshTitle());
-        box.actor.queue_relayout();
+    let box = getExpoThumbnailsBox();
+    if (!box || !box.thumbnails || box.thumbnails.length === 0) return;
+
+    logDebug("syncExpoThumbnails: syncing " + box.thumbnails.length + " thumbnails");
+
+    clearAllDropTargets();
+
+    // 1. Sort thumbnails array to match system workspace order
+    box.thumbnails.sort((a, b) => a.metaWorkspace.index() - b.metaWorkspace.index());
+
+    // 2. Re-order child actors inside box.actor to maintain proper z-order
+    if (box.actor && box.actor.set_child_at_index) {
+        try {
+            let childIdx = 1; // index 0 is box.background
+            for (let th of box.thumbnails) {
+                if (th.frame && th.frame.get_parent() === box.actor) {
+                    box.actor.set_child_at_index(th.frame, childIdx++);
+                }
+                if (th.actor && th.actor.get_parent() === box.actor) {
+                    box.actor.set_child_at_index(th.actor, childIdx++);
+                }
+                if (th.title && th.title.get_parent() === box.actor) {
+                    box.actor.set_child_at_index(th.title, childIdx++);
+                }
+            }
+            if (box.button && box.button.get_parent() === box.actor) {
+                box.button.raise_top();
+            }
+        } catch (e) {
+            logError("Error reordering child actors in box.actor: " + e);
+        }
     }
+
+    // 3. Update active workspace state and border highlight
+    let activeWs = global.workspace_manager.get_active_workspace();
+    let activeIndex = global.workspace_manager.get_active_workspace_index();
+    box.kbThumbnailIndex = activeIndex;
+
+    for (let i = 0; i < box.thumbnails.length; i++) {
+        let th = box.thumbnails[i];
+        if (!th) continue;
+        let isActive = (th.metaWorkspace === activeWs);
+        th.setActive(isActive);
+        if (isActive) {
+            box.lastActiveWorkspace = th;
+        }
+        th.showKeyboardSelectedState(i === activeIndex);
+        th.refreshTitle();
+    }
+
+    // 4. Force reallocation of thumbnails to their new slot coordinates
+    let allocBox = box.box || box.actor.get_allocation_box();
+    let flags = (Clutter.AllocationFlags && Clutter.AllocationFlags.FORCE_REALLOCATION) ?
+        Clutter.AllocationFlags.FORCE_REALLOCATION : 0;
+    if (allocBox) {
+        try {
+            box.allocate(box.actor, allocBox, flags);
+        } catch (e) {
+            logError("Error in box.allocate: " + e);
+        }
+    }
+
+    for (let th of box.thumbnails) {
+        if (th.actor) th.actor.queue_relayout();
+        if (th.frame) th.frame.queue_relayout();
+        if (th.title) th.title.queue_relayout();
+    }
+    box.actor.queue_relayout();
 }
 
 function reorderWorkspace(ws, targetIndex) {
@@ -875,6 +942,9 @@ function reorderWorkspace(ws, targetIndex) {
 
     wsMgr.reorder_workspace(ws, targetIndex);
     syncExpoThumbnails();
+    scheduleTimeout(50, () => {
+        syncExpoThumbnails();
+    });
 }
 
 function setupThumbnailDND(thumbnail) {
@@ -1135,8 +1205,9 @@ function enable() {
     };
 
     // Setup existing thumbnails if Expo is currently open
-    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
-        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+    let box = getExpoThumbnailsBox();
+    if (box && box.thumbnails) {
+        for (let th of box.thumbnails) {
             setupThumbnailDND(th);
             th.refreshTitle();
         }
@@ -1188,7 +1259,7 @@ function enable() {
     // 6. Register hotkey
     registerHotkeys();
 
-    logDebug("Extension 2.0.2 enabled successfully");
+    logDebug("Extension 2.0.3 enabled successfully");
 }
 
 function disable() {
@@ -1215,8 +1286,9 @@ function disable() {
     if (origGetWorkspaceName) Main.getWorkspaceName = origGetWorkspaceName;
     if (origHasDefaultWorkspaceName) Main.hasDefaultWorkspaceName = origHasDefaultWorkspaceName;
 
-    if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
-        for (let th of Main.expo._thumbnailsBox.thumbnails) {
+    let box = getExpoThumbnailsBox();
+    if (box && box.thumbnails) {
+        for (let th of box.thumbnails) {
             cleanUpThumbnailDND(th);
             th.refreshTitle();
         }

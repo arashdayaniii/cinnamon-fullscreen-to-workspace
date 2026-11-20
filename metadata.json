@@ -3,5 +3,5 @@
   "name": "Cinnamon Fullscreen To Workspace",
   "description": "macOS-style Dual-Workspace Architecture with dedicated fullscreen App Spaces, edge-hover panel reveal, window isolation, and Expo drag-and-drop workspace reordering.",
   "cinnamon-version": ["6.0", "6.2", "6.4", "6.6"],
-  "version": "2.0.2"
+  "version": "2.0.3"
 }
