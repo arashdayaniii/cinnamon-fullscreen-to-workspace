@@ -44,10 +44,7 @@ let origGetWorkspaceName = null;
 let origHasDefaultWorkspaceName = null;
 
 let cfg = {
-    resyncOnSwitch: true,
-    settleDelay: 100,
-    restoreMaximizeDelay: 0,
-    exitHotkey: "<Super><Shift>f",
+    exitHotkey: "<Super>f",
     enableLogs: false
 };
 
@@ -66,6 +63,14 @@ function scheduleTimeout(ms, fn) {
     });
     activeTimeouts.add(id);
     return id;
+}
+
+function cancelTimeout(id) {
+    if (!id) return;
+    if (activeTimeouts.has(id)) {
+        activeTimeouts.delete(id);
+        try { GLib.source_remove(id); } catch (e) {}
+    }
 }
 
 function clearAllTimeouts() {
@@ -379,40 +384,113 @@ function exitAppSpace(win) {
         targetWs.activate(global.get_current_time());
         win.activate(global.get_current_time());
 
-        // 2. Call unmake_fullscreen
-        if (win.is_fullscreen()) {
-            win.unmake_fullscreen();
-        }
-
-        // 3. Settle tick for Muffin to finish un-fullscreening and recalculate workarea
-        scheduleTimeout(50, () => {
+        let doRestore = () => {
             if (!isWindowAlive(win)) return;
 
+            let wa = getWorkAreaRect(win);
+
             if (data.wasMaximized) {
-                // Restore maximized state directly without move_resize_frame
-                win.maximize(data.savedMaximizedFlags || Meta.MaximizeFlags.BOTH);
+                let flags = data.savedMaximizedFlags || Meta.MaximizeFlags.BOTH;
+
+                // Function to verify and enforce clean flush maximization
+                let applyAndVerifyMaximize = (attempt) => {
+                    if (!isWindowAlive(win)) return;
+                    let curWa = getWorkAreaRect(win);
+                    let f = win.get_frame_rect();
+
+                    let checkX = (flags & Meta.MaximizeFlags.HORIZONTAL) !== 0 || flags === Meta.MaximizeFlags.BOTH;
+                    let checkY = (flags & Meta.MaximizeFlags.VERTICAL) !== 0 || flags === Meta.MaximizeFlags.BOTH;
+                    let isAligned = (!checkX || (f.x === curWa.x && f.width === curWa.width)) &&
+                                    (!checkY || (f.y === curWa.y && f.height === curWa.height));
+
+                    if (!isAligned || !win.maximized_horizontally || !win.maximized_vertically) {
+                        logDebug(`Restoring maximize for ${data.appName} (attempt ${attempt}): current frame [${f.x},${f.y},${f.width},${f.height}] vs workarea [${curWa.x},${curWa.y},${curWa.width},${curWa.height}]`);
+                        // Unmaximize first to clear any stale Muffin state & CSD offset
+                        win.unmaximize(Meta.MaximizeFlags.BOTH);
+                        scheduleTimeout(30, () => {
+                            if (!isWindowAlive(win)) return;
+                            win.maximize(flags);
+                            let actor = win.get_compositor_private();
+                            if (actor) actor.queue_redraw();
+
+                            if (attempt < 4) {
+                                scheduleTimeout(50, () => {
+                                    applyAndVerifyMaximize(attempt + 1);
+                                });
+                            }
+                        });
+                    } else {
+                        logDebug(`Maximize restored flush for ${data.appName} at [${f.x},${f.y},${f.width},${f.height}]`);
+                        let actor = win.get_compositor_private();
+                        if (actor) actor.queue_redraw();
+                    }
+                };
+
+                // Unmaximize first to clear stale Muffin flags & CSD negative coordinates
+                win.unmaximize(Meta.MaximizeFlags.BOTH);
+                scheduleTimeout(20, () => {
+                    if (!isWindowAlive(win)) return;
+                    win.maximize(flags);
+                    scheduleTimeout(40, () => {
+                        applyAndVerifyMaximize(1);
+                    });
+                });
             } else {
                 win.unmaximize(Meta.MaximizeFlags.BOTH);
-                let wa = getWorkAreaRect(win);
                 let r = data.savedFloatingRect || { width: 900, height: 600, x: wa.x + 50, y: wa.y + 50 };
-                let gx = Math.max(wa.x, Math.min(r.x, wa.x + wa.width - 50));
-                let gy = Math.max(wa.y, Math.min(r.y, wa.y + wa.height - 50));
                 let gw = Math.min(r.width, wa.width);
                 let gh = Math.min(r.height, wa.height);
+                let maxX = Math.max(wa.x, wa.x + wa.width - gw);
+                let maxY = Math.max(wa.y, wa.y + wa.height - gh);
+                let gx = Math.max(wa.x, Math.min(r.x, maxX));
+                let gy = Math.max(wa.y, Math.min(r.y, maxY));
                 win.move_resize_frame(false, gx, gy, gw, gh);
                 win._savedFloatingRect = { x: gx, y: gy, width: gw, height: gh };
+                let actor = win.get_compositor_private();
+                if (actor) actor.queue_redraw();
             }
 
-            let actor = win.get_compositor_private();
-            if (actor) actor.queue_redraw();
             win.activate(global.get_current_time());
-        });
+        };
+
+        // 2. Unmake fullscreen event-driven: wait for notify::fullscreen to become false + settle
+        if (win.is_fullscreen()) {
+            let restored = false;
+            let sigId = 0;
+            let fallbackTimeoutId = 0;
+
+            let finish = () => {
+                if (restored) return;
+                restored = true;
+                if (sigId && isWindowAlive(win)) {
+                    try { win.disconnect(sigId); } catch (e) {}
+                    sigId = 0;
+                }
+                if (fallbackTimeoutId) {
+                    cancelTimeout(fallbackTimeoutId);
+                    fallbackTimeoutId = 0;
+                }
+                // Settle tick for Muffin to finish un-fullscreening and recalculate workarea
+                scheduleTimeout(30, doRestore);
+            };
+
+            sigId = win.connect('notify::fullscreen', () => {
+                if (!win.is_fullscreen()) {
+                    finish();
+                }
+            });
+
+            fallbackTimeoutId = scheduleTimeout(150, finish);
+            win.unmake_fullscreen();
+        } else {
+            scheduleTimeout(30, doRestore);
+        }
     }
 
     appSpaces.delete(appWs);
 
     // Remove the App Space workspace after the window has returned and settled
-    scheduleTimeout(100, () => {
+    scheduleTimeout(250, () => {
         try {
             if (typeof Main._removeWorkspace === "function") {
                 Main._removeWorkspace(appWs);
@@ -825,9 +903,11 @@ function onWorkspaceSwitched() {
         Main.layoutManager._chrome._updateVisibility();
     } else {
         let data = appSpaces.get(activeWs);
-        if (data && data.ownerWindow && cfg.resyncOnSwitch) {
-            scheduleTimeout(cfg.settleDelay, () => {
-                verifyFullscreen(data.ownerWindow);
+        if (data && data.ownerWindow && !data.isExiting) {
+            scheduleTimeout(50, () => {
+                if (isWindowAlive(data.ownerWindow) && !data.isExiting) {
+                    verifyFullscreen(data.ownerWindow);
+                }
             });
         }
     }
@@ -1073,11 +1153,19 @@ function registerHotkeys() {
 
 function init(metadata) {
     extSettings = new Settings.ExtensionSettings(cfg, metadata.uuid);
-    extSettings.bind("resync-on-switch", "resyncOnSwitch");
-    extSettings.bind("settle-delay", "settleDelay");
-    extSettings.bind("restore-maximize-delay", "restoreMaximizeDelay");
     extSettings.bind("exit-hotkey", "exitHotkey", registerHotkeys);
     extSettings.bind("enable-logs", "enableLogs");
+
+    // Migrate old default (<Super><Shift>f) to new default (<Super>f)
+    if (cfg.exitHotkey === "<Super><Shift>f" || cfg.exitHotkey === "<Shift><Super>f") {
+        try {
+            extSettings.setValue("exit-hotkey", "<Super>f");
+            cfg.exitHotkey = "<Super>f";
+            logDebug("Migrated shortcut from <Super><Shift>f to <Super>f");
+        } catch (e) {
+            logDebug(`Could not auto-migrate exit-hotkey setting: ${e}`);
+        }
+    }
 }
 
 function enable() {
@@ -1259,7 +1347,7 @@ function enable() {
     // 6. Register hotkey
     registerHotkeys();
 
-    logDebug("Extension 2.0.3 enabled successfully");
+    logDebug("Extension 2.0.4 enabled successfully");
 }
 
 function disable() {

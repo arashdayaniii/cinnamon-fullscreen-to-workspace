@@ -1,47 +1,13 @@
 {
-  "header-behavior": {
-    "type": "header",
-    "description": "Workspace Behavior"
-  },
-  "resync-on-switch": {
-    "type": "switch",
-    "default": true,
-    "description": "Auto-resync window geometry when switching back to a dedicated workspace",
-    "tooltip": "Fixes X11 fractional scaling offset or clipping when returning to a dedicated workspace."
-  },
-  "header-timing": {
-    "type": "header",
-    "description": "Timing & Fractional Scaling Tuning"
-  },
-  "settle-delay": {
-    "type": "spinbutton",
-    "default": 100,
-    "min": 0,
-    "max": 600,
-    "step": 10,
-    "units": "ms",
-    "description": "Workspace settle delay",
-    "tooltip": "Delay after switching workspaces before resizing the window. Use 0 ms on 100% display scale; 100-250 ms works well on fractional scaling (e.g. 125%)."
-  },
-  "restore-maximize-delay": {
-    "type": "spinbutton",
-    "default": 0,
-    "min": 0,
-    "max": 400,
-    "step": 10,
-    "units": "ms",
-    "description": "Restore maximize delay",
-    "tooltip": "Delay between resetting the window frame and re-maximizing when returning a previously maximized window to its original workspace."
-  },
   "header-shortcuts": {
     "type": "header",
     "description": "Keyboard Shortcuts"
   },
   "exit-hotkey": {
     "type": "keybinding",
-    "default": "<Super><Shift>f",
-    "description": "Toggle dedicated workspace (Open / Exit)",
-    "tooltip": "Sends the focused window to a dedicated workspace, or returns it to its original workspace if already in one."
+    "default": "<Super>f",
+    "description": "Toggle App Space (Fullscreen to Workspace)",
+    "tooltip": "Sends the focused window to a dedicated fullscreen App Space, or returns it to its original workspace if already in one."
   },
   "header-debug": {
     "type": "header",
