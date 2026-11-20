@@ -840,7 +840,7 @@ function onWorkspaceSwitched() {
 function clearAllDropTargets() {
     if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
         for (let th of Main.expo._thumbnailsBox.thumbnails) {
-            if (th.frame) {
+            if (th && th.frame) {
                 th.frame.remove_style_class_name('expo-workspace-drop-target');
             }
         }
@@ -908,19 +908,82 @@ function setupThumbnailDND(thumbnail) {
         return this.actor;
     };
 
+    // Use manualMode: true so DND does not connect button-press-event itself
     thumbnail._actorDraggable = DND.makeDraggable(thumbnail.actor, {
         restoreOnSuccess: false,
-        manualMode: false
+        manualMode: true
     });
     thumbnail._actorDraggable.connect('drag-end', clearAllDropTargets);
     thumbnail._actorDraggable.connect('drag-cancelled', clearAllDropTargets);
 
     thumbnail._titleDraggable = DND.makeDraggable(thumbnail.title, {
         restoreOnSuccess: false,
-        manualMode: false
+        manualMode: true
     });
     thumbnail._titleDraggable.connect('drag-end', clearAllDropTargets);
     thumbnail._titleDraggable.connect('drag-cancelled', clearAllDropTargets);
+
+    // Captured event on thumbnail.actor: runs in capture phase BEFORE the stock button-press-event
+    thumbnail._capturedId = thumbnail.actor.connect('captured-event', (actor, event) => {
+        if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1) {
+            let isApp = isAppSpace(thumbnail.metaWorkspace);
+
+            // On NORMAL workspaces, allow window clones to receive their own DND press!
+            if (!isApp) {
+                let source = event.get_source();
+                let isClone = false;
+                let a = source;
+                while (a && a !== thumbnail.actor) {
+                    if (a._delegate && a._delegate instanceof ExpoThumbnail.ExpoWindowClone) {
+                        isClone = true;
+                        break;
+                    }
+                    a = a.get_parent();
+                }
+                if (isClone) {
+                    return false;
+                }
+            }
+
+            // For card drags (all APP_SPACE clicks, or empty card clicks on NORMAL workspaces)
+            if (thumbnail._actorDraggable) {
+                thumbnail._actorDraggable._onButtonPress(actor, event);
+            }
+        }
+        return false;
+    });
+
+    // Captured event on thumbnail.title for dragging workspace from title header
+    thumbnail._titleCapturedId = thumbnail.title.connect('captured-event', (actor, event) => {
+        if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1) {
+            if (thumbnail._titleDraggable) {
+                thumbnail._titleDraggable._onButtonPress(actor, event);
+            }
+        }
+        return false;
+    });
+}
+
+function cleanUpThumbnailDND(thumbnail) {
+    if (!thumbnail) return;
+    if (thumbnail._capturedId && thumbnail.actor) {
+        try { thumbnail.actor.disconnect(thumbnail._capturedId); } catch (e) {}
+        thumbnail._capturedId = 0;
+    }
+    if (thumbnail._titleCapturedId && thumbnail.title) {
+        try { thumbnail.title.disconnect(thumbnail._titleCapturedId); } catch (e) {}
+        thumbnail._titleCapturedId = 0;
+    }
+    if (thumbnail._actorDraggable) {
+        try { thumbnail._actorDraggable.disconnectAll(); } catch (e) {}
+        delete thumbnail._actorDraggable;
+    }
+    if (thumbnail._titleDraggable) {
+        try { thumbnail._titleDraggable.disconnectAll(); } catch (e) {}
+        delete thumbnail._titleDraggable;
+    }
+    delete thumbnail._customDndInitialized;
+    delete thumbnail.isWorkspaceCard;
 }
 
 // ==========================================
@@ -951,22 +1014,8 @@ function enable() {
     // 1. Hook Expo Workspace Thumbnail prototype methods
     origExpoThumbnailInit = ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init;
     ExpoThumbnail.ExpoWorkspaceThumbnail.prototype._init = function(metaWorkspace, box) {
-        // Intercept button-press-event so the stock click handler does not swallow events with return true,
-        // allowing DND.makeDraggable to receive the event and initiate dragging!
-        let origActorConnect = this.actor.connect;
-        this.actor.connect = function(signal, callback) {
-            if (signal === 'button-press-event') {
-                return origActorConnect.call(this, signal, (actor, event) => {
-                    callback(actor, event);
-                    return false; // Crucial: allow DND.makeDraggable to process button-press
-                });
-            }
-            return origActorConnect.apply(this, arguments);
-        };
-
+        // ALWAYS run origExpoThumbnailInit FIRST so this.actor, this.frame, this.title, etc. exist!
         origExpoThumbnailInit.apply(this, arguments);
-
-        this.actor.connect = origActorConnect;
         setupThumbnailDND(this);
     };
 
@@ -1139,7 +1188,7 @@ function enable() {
     // 6. Register hotkey
     registerHotkeys();
 
-    logDebug("Extension 2.0.1 enabled successfully");
+    logDebug("Extension 2.0.2 enabled successfully");
 }
 
 function disable() {
@@ -1168,16 +1217,7 @@ function disable() {
 
     if (Main.expo && Main.expo._thumbnailsBox && Main.expo._thumbnailsBox.thumbnails) {
         for (let th of Main.expo._thumbnailsBox.thumbnails) {
-            delete th._customDndInitialized;
-            delete th.isWorkspaceCard;
-            if (th._titleDraggable) {
-                try { th._titleDraggable.disconnectAll(); } catch (e) {}
-                delete th._titleDraggable;
-            }
-            if (th._actorDraggable) {
-                try { th._actorDraggable.disconnectAll(); } catch (e) {}
-                delete th._actorDraggable;
-            }
+            cleanUpThumbnailDND(th);
             th.refreshTitle();
         }
     }
